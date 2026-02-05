@@ -157,19 +157,39 @@ class ThresholdGuessBinarizer(BaseEstimator, TransformerMixin):
         clf.fit(X, y)
         thresholds = []
         estimators = clf.estimators_
+        n_estimators = estimators.shape[0]
+        n_classes = estimators.shape[1] # can view as one-versus-many
+
         for j in range(self.n_features_in_):
             thresholds_j = []
-            for k in range(len(estimators)):
-                thresholds_j.append(self.__threshold(estimators[k, 0], j))
+            for k in range(n_estimators):
+                for c in range(n_classes):
+                    tj = self.__threshold(estimators[k, c], j)
+                    if tj.size: # this seemingly isn't needed as the code doesn't crash, but just in case
+                        thresholds_j.append(tj)
+
+            if not thresholds_j:
+                continue
+
             thresholds_j = np.unique(np.concatenate(thresholds_j))
             for thresh in thresholds_j:
                 thresholds.append((j, thresh))
+
+        # for j in range(self.n_features_in_):
+        #     thresholds_j = []
+        #     for k in range(len(estimators)):
+        #         thresholds_j.append(self.__threshold(estimators[k, 0], j))
+        #     thresholds_j = np.unique(np.concatenate(thresholds_j))
+        #     for thresh in thresholds_j:
+        #         thresholds.append((j, thresh))
 
         # Perform Dataset thresholding based on found thresholds
         X_thr = np.zeros((X.shape[0], len(thresholds)))
         for i, (j, thresh) in enumerate(thresholds):
             X_thr[:, i] = X[:, j] <= thresh
+            
         X_thr = X_thr.astype(float)
+        X_thr, thresholds = self.__dedup_identical_columns(X_thr, thresholds) # deduplicated
 
         # Refit the model on the thresholded data
         if self.column_elimination:
@@ -181,6 +201,18 @@ class ThresholdGuessBinarizer(BaseEstimator, TransformerMixin):
 
         # Return the transformer
         return self
+    
+    def __dedup_identical_columns(self, X_bin, thresholds):
+        Xb = X_bin.astype(bool)
+        packed = np.packbits(Xb, axis=0)  # for efficiency in comparison: (ceil(n_samples/8), n_cols)
+
+        # indices of unique columns
+        _, keep_idx = np.unique(packed, axis=1, return_index=True)
+
+        keep_idx = np.sort(keep_idx)  # preserve order
+        X_bin = X_bin[:, keep_idx]
+        thresholds = [thresholds[i] for i in keep_idx.tolist()]
+        return X_bin, thresholds
 
     def get_feature_names_out(self, *args, **params):
         """
@@ -249,10 +281,13 @@ class ThresholdGuessBinarizer(BaseEstimator, TransformerMixin):
         while curr_score >= base_score and i < max_iter and clf.feature_importances_.size > 0:
             # Find the least important feature
             least_important = np.argmin(clf.feature_importances_)
-            last_removed = (X[:, least_important], thresholds[least_important])
+            # last_removed = (X[:, least_important], thresholds[least_important])
+            # last_removed = thresholds[least_important] # just need the threshold
+            last_removed = thresholds.pop(least_important)
             # Remove the least important feature
             X = np.delete(X, least_important, axis=1)
-            thresholds.remove(thresholds[least_important])
+            # thresholds.remove(thresholds[least_important])
+            # thresholds.pop(least_important) # we should avoid duplicate tuples but just in case
             # Re-fit the model
             clf.fit(X, y)
             # Update the current score
@@ -261,7 +296,7 @@ class ThresholdGuessBinarizer(BaseEstimator, TransformerMixin):
         
         # Add the last removed feature back
         if last_removed is not None:
-            thresholds.append(last_removed[1])
+            thresholds.append(last_removed) # no need for [1] as we store just what we need
         
         return thresholds
     
