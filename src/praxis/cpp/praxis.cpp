@@ -426,6 +426,7 @@ private:
     int n_words = 0;
     uint64_t tail_mask = ~0ULL; // to clear high bits in last word
     int lamN = 0;
+    int8_t trained_depth_budget = -1; 
 
     int best_objective = 0;
     int obj_bound = 0;
@@ -615,6 +616,7 @@ public:
         n_words = (n_samples + 63) / 64; // 64 -> 1, 65 -> 2
         tail_mask = (n_samples % 64) ? ((1ULL << (n_samples % 64)) - 1ULL) : ~0ULL; // if multiple of 64, all 1s. otherwise, n_samples % 64 1s followed by 0s.
         lamN = (int)llround(lambda * (double)n_samples);
+        trained_depth_budget = depth_budget;
         lookahead_init = lookahead_k;
         use_multipass = use_multipass_flag;
         rule_list_mode = rule_list_mode_flag;
@@ -735,20 +737,65 @@ public:
     }
 
     // predict using the i-th tree in the Rashomon set: X_row_major: binary [n_samples][n_features]
-    std::vector<uint8_t> get_predictions(uint64_t tree_index, const std::vector<std::vector<uint8_t>>& X_row_major) const {
-        if (!result) {
-            throw std::runtime_error("No Rashomon trie has been constructed. Call fit() first.");
-        }
+    // std::vector<uint8_t> get_predictions(uint64_t tree_index, const std::vector<std::vector<uint8_t>>& X_row_major) const {
+    //     const std::size_t n_samples = X_row_major.size();
+    //     const std::size_t n_features = X_row_major[0].size();
+    //     const int8_t depth_budget = trained_depth_budget;
+    //     if ((int)n_features != this->n_features) {
+    //         throw std::runtime_error("Prediction X has different number of features than training.");
+    //     }
 
+    //     if (!result) {
+    //         throw std::runtime_error("No Rashomon trie has been constructed. Call fit() first.");
+    //     }
+
+    //     auto tree = get_ith_tree(tree_index);
+    //     std::vector<uint8_t> out(n_samples, 0);
+
+    //     std::vector<int> idx(n_samples);
+    //     for (std::size_t i = 0; i < n_samples; ++i) {
+    //         idx[i] = static_cast<int>(i);
+    //     }
+
+    //     predict_tree_recursive(tree.get(), X_row_major, out, idx);
+    //     return out;
+    // }
+
+    // predict using the i-th tree in the Rashomon set: X_row_major: binary [n_samples][n_features]
+    std::vector<uint8_t> get_predictions(uint64_t tree_index, const std::vector<std::vector<uint8_t>>& X_row_major) const {
         const std::size_t n_samples = X_row_major.size();
         if (n_samples == 0) return {};
 
         const std::size_t n_features = X_row_major[0].size();
+        const int8_t depth_budget = trained_depth_budget;
+
         if ((int)n_features != this->n_features) {
             throw std::runtime_error("Prediction X has different number of features than training.");
         }
 
-        auto tree = get_ith_tree(tree_index);
+        std::shared_ptr<PredNode> tree;
+
+        // single tree mode
+        if (!result) {
+            if (tree_index != 0) {
+                throw std::runtime_error("Single-tree mode only supports tree_index == 0.");
+            }
+            if (depth_budget < 0) {
+                throw std::runtime_error("trained_depth_budget not set. Call fit() first.");
+            }
+
+            Packed root((size_t)n_words);
+            for (int i = 0; i < n_words - 1; ++i) root.w[(size_t)i] = ~0ULL;
+            root.w[(size_t)(n_words - 1)] = tail_mask;
+
+            const PathKey& root_pk = empty_pk();
+            tree = build_best_tree_from_caches(root, depth_budget, root_pk);
+        } 
+        // standard rashomon mode
+        else {
+            tree = get_ith_tree(tree_index);
+        }
+
         std::vector<uint8_t> out(n_samples, 0);
 
         std::vector<int> idx(n_samples);
@@ -759,6 +806,7 @@ public:
         predict_tree_recursive(tree.get(), X_row_major, out, idx);
         return out;
     }
+
 
     // get predictions from all trees in the rashomon set, as a vector of prediction vectors (one per tree).
     std::vector<std::vector<uint8_t>> get_all_predictions(
@@ -775,12 +823,47 @@ public:
 
     // paths[k] is a list of ints - one path per leaf; +f = went left on feature f, -f = went right. this array of a path encodes the splits in the tree to the kth leaf.
     // predictions[k] is the 0/1 label at that leaf.
+    // std::pair<std::vector<std::vector<int>>, std::vector<int>>
+    // get_tree_paths(std::uint64_t tree_index) const {
+    //     if (!result) {
+    //         throw std::runtime_error("No Rashomon trie has been constructed. Call fit() first.");
+    //     }
+
+    //     auto tree = get_ith_tree(tree_index);
+    //     std::vector<std::vector<int>> paths;
+    //     std::vector<int> preds;
+    //     std::vector<int> current;
+
+    //     collect_paths(tree.get(), current, paths, preds);
+    //     return {paths, preds};
+    // }
+
     std::pair<std::vector<std::vector<int>>, std::vector<int>>
     get_tree_paths(std::uint64_t tree_index) const {
+        // single tree mode
         if (!result) {
-            throw std::runtime_error("No Rashomon trie has been constructed. Call fit() first.");
+            if (tree_index != 0) {
+                throw std::out_of_range("Single-tree mode only supports tree_index == 0.");
+            }
+
+            // root mask - all samples active
+            Packed root(n_words);
+            for (int i = 0; i < n_words - 1; ++i) root.w[i] = ~0ULL;
+            root.w[n_words - 1] = tail_mask;
+
+            const PathKey& root_pk = empty_pk();
+            const int8_t depth_budget = trained_depth_budget;
+
+            auto tree = build_best_tree_from_caches(root, depth_budget, root_pk);
+
+            std::vector<std::vector<int>> paths;
+            std::vector<int> preds;
+            std::vector<int> current;
+            collect_paths(tree.get(), current, paths, preds);
+            return {paths, preds};
         }
 
+        // standard rashomon mode
         auto tree = get_ith_tree(tree_index);
         std::vector<std::vector<int>> paths;
         std::vector<int> preds;
@@ -789,6 +872,7 @@ public:
         collect_paths(tree.get(), current, paths, preds);
         return {paths, preds};
     }
+
 
     // for individual decision tree algorithm
     std::pair<std::vector<std::vector<int>>, std::vector<int>>
