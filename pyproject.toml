@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "praxis"
-version = "0.0.6"
+version = "0.0.7"
 description = "Rashomon set tools via PRAXIS (includes approximation, exact calculation, and variable importance utilities)"
 requires-python = ">=3.9"
 license = {text = "MIT"}
