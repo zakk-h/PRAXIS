@@ -82,9 +82,15 @@ class PRAXIS:
         return self._model.get_root_histogram()
     
     def get_tree_objective(self, tree_index: int):
-
         obj, obj_norm = self._model.get_tree_objective(int(tree_index))
         return obj, obj_norm
+    
+    def count_trees_within_mult(self, mult: float) -> int:
+        hist = self.get_root_histogram()
+        min_obj = self.get_min_objective()
+        thresh = round((1.0 + mult) * min_obj)
+        return sum(cnt for obj, cnt in hist if obj <= thresh)
+
 
     # WARNING: 1-indexed unlike features
     def get_tree_paths(self, tree_index: int):

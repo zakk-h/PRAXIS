@@ -624,6 +624,10 @@ public:
         cache_cheap_subproblems = cache_cheap_subproblems_flag;
         oracle_style = oracle_style_in;
         proxy_caching_enabled = proxy_caching_flag;
+        if (!rashomon_mode) { // force proxy caching on in single-tree mode - required for this codebase
+            proxy_caching_enabled = true;
+            cache_cheap_subproblems = true;
+        } 
         if (num_proxy_features_in <= 0) num_proxy_features = n_features;
         else num_proxy_features = std::min(num_proxy_features_in, n_features);
 
@@ -892,8 +896,51 @@ public:
 
     // return (unnormalized_objective, normalized_objective) for the ith tree
     std::pair<int, double> get_ith_tree_objective(std::uint64_t i) const {
+        // if (!result) {
+        //     throw std::runtime_error("No Rashomon trie has been constructed. Call fit() first.");
+        // }
         if (!result) {
-            throw std::runtime_error("No Rashomon trie has been constructed. Call fit() first.");
+            if (i != 0) throw std::out_of_range("Single-tree mode only supports i==0.");
+            if (!proxy_caching_enabled) {
+                throw std::runtime_error("Single-tree objective requires proxy_caching_enabled, or recompute objective.");
+            }
+            if (trained_depth_budget < 0) {
+                throw std::runtime_error("trained_depth_budget not set. Call fit() first.");
+            }
+
+            // root mask
+            Packed root((size_t)n_words);
+            for (int w = 0; w < n_words - 1; ++w) root.w[(size_t)w] = ~0ULL;
+            root.w[(size_t)(n_words - 1)] = tail_mask;
+
+            const PathKey& root_pk = empty_pk();
+            const int8_t d = trained_depth_budget;
+
+            const uint64_t km = key_of_subproblem(root, root_pk);
+
+            int best = std::numeric_limits<int>::max(); // it suffices to return the minimum among the root caches
+
+            // greedy
+            if (auto itg = greedy_cache.find(K2{km, d}); itg != greedy_cache.end())
+                best = std::min(best, itg->second);
+
+            // lickety
+            if (use_kla_cache()) {
+                for (int kk = 0; kk <= (int)(d - 1); ++kk) {
+                    auto it = lickety_cache_kla.find(KLA{km, d, kk});
+                    if (it != lickety_cache_kla.end()) best = std::min(best, it->second);
+                }
+            } else {
+                if (auto it = lickety_cache_k2.find(K2{km, d}); it != lickety_cache_k2.end())
+                    best = std::min(best, it->second);
+            }
+
+            if (best == std::numeric_limits<int>::max()) {
+                throw std::runtime_error("Root objective not found in caches (greedy/lickety).");
+            }
+
+            double normalized = (double)best / (double)n_samples;
+            return {best, normalized};
         }
 
         result->ensure_hist_built();
@@ -1927,6 +1974,7 @@ private:
         // helper: lookup min cached objective for (mask, depth, pk) across greedy + lickety caches
         auto best_cached_obj = [&](const Packed& m, int8_t d, const PathKey& pk_child) -> int {
             if (d < 0) return 0;
+            if (d==0) return leaf_objective(m);
             if (!proxy_caching_enabled) return INF;
 
             const uint64_t km = key_of_subproblem(m, pk_child);
