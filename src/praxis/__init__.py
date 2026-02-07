@@ -2,21 +2,24 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch, Circle
 from matplotlib.lines import Line2D
+from matplotlib.cm import get_cmap
 from ._core import PRAXIS as _PRAXISCore, rid_subtractive_model_reliance as _rid_subtractive_core
 from ._threshold_guessing import ThresholdGuessBinarizer
 
 # __all__ = ["PRAXIS"]
-__all__ = ["PRAXIS", "RashomonImportanceDistribution", "ThresholdGuessBinarizer"]
+#__all__ = ["PRAXIS", "RashomonImportanceDistribution", "ThresholdGuessBinarizer"]
+__all__ = ["PRAXIS", "ThresholdGuessBinarizer"]
 
-def RashomonImportanceDistribution(X, y, n_boot=10, lambda_reg=0.01, depth_budget=5, rashomon_mult=0.03, lookahead_k=1, seed=0, memory_efficient=False, binning_map=None):
-    X = np.asarray(X, dtype=np.uint8)
-    y = np.asarray(y, dtype=int)
-    return _rid_subtractive_core(X, y, int(n_boot), float(lambda_reg), int(depth_budget), float(rashomon_mult), int(lookahead_k), int(seed), bool(memory_efficient), binning_map)
+# def RashomonImportanceDistribution(X, y, n_boot=10, lambda_reg=0.01, depth_budget=5, rashomon_mult=0.03, lookahead_k=1, seed=0, memory_efficient=False, binning_map=None):
+#     X = np.asarray(X, dtype=np.uint8)
+#     y = np.asarray(y, dtype=int)
+#     return _rid_subtractive_core(X, y, int(n_boot), float(lambda_reg), int(depth_budget), float(rashomon_mult), int(lookahead_k), int(seed), bool(memory_efficient), binning_map)
 
 class PRAXIS:
     def __init__(self):
         # self._model = _core.PRAXIS()
         self._model = _PRAXISCore()
+        self._rid_out = None
 
     def fit(
         self,
@@ -123,7 +126,7 @@ class PRAXIS:
         X = np.asarray(X, dtype=np.uint8)
         return self._model.get_all_predictions(X, bool(stack))
     
-    def plot_tree(self, tree_index: int, feature_names=None, figsize=(8, 6), ax=None):
+    def plot_tree(self, tree_index: int, feature_names=None, figsize=(8, 6), ax=None, title=None, show=True):
         paths, preds = self.get_tree_paths(tree_index)
 
         # feature names if not given
@@ -341,8 +344,11 @@ class PRAXIS:
         ax.set_ylim(min(ys) - pad_y, max(ys) + pad_y)
         ax.set_aspect("equal", adjustable="box")
         ax.set_axis_off()
-        plt.title(f"PRAXIS Tree {tree_index}")
-        plt.show()
+        ax.set_title(f"PRAXIS Tree {tree_index}" if title is None else str(title))
+        if show:
+            plt.show()
+        return fig, ax
+
 
         
     def get_tree_frontier_scores(self, tree_index: int, depth_budget: int):
@@ -351,4 +357,277 @@ class PRAXIS:
 
     def root_lickety_objective_lookahead1(self, depth_budget: int):
         return int(self._model.root_lickety_objective_lookahead1(int(depth_budget)))
+
+    def compute_rid(
+        self,
+        X,
+        y,
+        n_boot=10,
+        lambda_reg=0.01,
+        depth_budget=5,
+        rashomon_mult=0.03,
+        lookahead_k=1,
+        seed=0,
+        memory_efficient=False,
+        binning_map=None,
+    ):
+        X = np.asarray(X, dtype=np.uint8)
+        y = np.asarray(y, dtype=int)
+
+        self._rid_out = _rid_subtractive_core(
+            X,
+            y,
+            int(n_boot),
+            float(lambda_reg),
+            int(depth_budget),
+            float(rashomon_mult),
+            int(lookahead_k),
+            int(seed),
+            bool(memory_efficient),
+            binning_map,
+        )
+        return self._rid_out
+    
+    def _require_rid(self):
+        if self._rid_out is None:
+            raise RuntimeError("RID not computed. Call compute_rid(...) first.")
+        return self._rid_out
+    
+    def rid_plot_mean(self, feature_names=None, **kwargs):
+        rid_out = self._require_rid()
+        return rid_plot_mean(rid_out, feature_names=feature_names, **kwargs)
+
+    def rid_plot_violin(self, feature_names=None, **kwargs):
+        rid_out = self._require_rid()
+        return rid_plot_violin(rid_out, feature_names=feature_names, **kwargs)
+
+    def rid_plot_cdfs(self, feature_names=None, **kwargs):
+        rid_out = self._require_rid()
+        return rid_plot_cdfs(rid_out, feature_names=feature_names, **kwargs)
+
+def _rid_style_ax(ax):
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(True, alpha=0.25)
+
+
+def _rid_feature_names(feature_names, V):
+    if feature_names is None:
+        return [f"f{j}" for j in range(V)]
+    if len(feature_names) != V:
+        raise ValueError(f"feature_names must have length {V}, got {len(feature_names)}")
+    return list(feature_names)
+
+
+def _rid_sorted_xy(xs, ps):
+    xs = np.asarray(xs, float)
+    ps = np.asarray(ps, float)
+    if xs.size == 0:
+        return xs, ps
+    idx = np.argsort(xs)
+    xs, ps = xs[idx], ps[idx]
+    ps = np.clip(ps, 0.0, 1.0)
+    ps = np.maximum.accumulate(ps)
+    return xs, ps
+
+
+def _rid_pmf_from_cdf(xs, ps):
+    if xs.size == 0:
+        return xs, np.asarray([], float)
+    pprev = np.concatenate([[0.0], ps[:-1]])
+    w = ps - pprev
+    w = np.maximum(w, 0.0)
+    s = w.sum()
+    if s <= 0:
+        w = np.ones_like(w) / max(1, w.size)
+    else:
+        w = w / s
+    return xs, w
+
+
+def rid_plot_mean(
+    rid_out,
+    feature_names=None,
+    figsize=(10, 3),
+    ax=None,
+    title="RID mean reliance per feature",
+    show=True,
+):
+    mean = np.asarray(rid_out["mean_sub_mr"], dtype=float)
+    V = int(mean.size)
+    feature_names = _rid_feature_names(feature_names, V)
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    x = np.arange(V)
+    ax.scatter(x, mean, s=30)
+    ax.set_xticks(x)
+    ax.set_xticklabels(feature_names, rotation=45, ha="right")
+    ax.set_xlabel("feature")
+    ax.set_ylabel("mean reliance\n(average accuracy drop when scrambled)")
+    ax.set_title(title)
+    _rid_style_ax(ax)
+
+    fig.tight_layout()
+    if show:
+        plt.show()
+    return fig, ax
+
+
+def rid_plot_violin(
+    rid_out,
+    feature_names=None,
+    samples_per_feature=4000,
+    seed=123,
+    figsize=(10, 6),
+    ax=None,
+    title="RID distribution per feature",
+    show=True,
+):
+    mean = np.asarray(rid_out["mean_sub_mr"], dtype=float)
+    cdf_x = rid_out["cdf_x"]
+    cdf_p = rid_out["cdf_p"]
+
+    V = int(mean.size)
+    feature_names = _rid_feature_names(feature_names, V)
+
+    order = np.argsort(-mean)
+    mean_s = mean[order]
+    names_s = [feature_names[j] for j in order]
+
+    cdf_pairs = []
+    xmin, xmax = 0.0, 0.0
+    for j in range(V):
+        xs, ps = _rid_sorted_xy(cdf_x[j], cdf_p[j])
+        cdf_pairs.append((xs, ps))
+        if xs.size:
+            xmin = min(xmin, float(xs[0]))
+            xmax = max(xmax, float(xs[-1]))
+
+    rng = np.random.default_rng(seed)
+    samples_sorted = []
+    for j in order:
+        xs, ps = cdf_pairs[int(j)]
+        xs, w = _rid_pmf_from_cdf(xs, ps)
+        if xs.size == 0:
+            samples_sorted.append(np.zeros(int(samples_per_feature), float))
+        else:
+            samples_sorted.append(
+                rng.choice(xs, size=int(samples_per_feature), replace=True, p=w)
+            )
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    parts = ax.violinplot(
+        samples_sorted,
+        positions=np.arange(V),
+        vert=False,
+        widths=0.85,
+        showmeans=False,
+        showmedians=False,
+        showextrema=False,
+    )
+    for body in parts["bodies"]:
+        body.set_alpha(0.65)
+
+    med_sorted = np.array([np.median(s) for s in samples_sorted])
+    # ax.scatter(med_sorted, np.arange(V), s=18, zorder=3, label="median")
+    # ax.scatter(mean_s, np.arange(V), s=22, zorder=3, marker="x", label="mean")
+    # median: white dot with black outline (high contrast on top of violin)
+    ax.scatter(
+        med_sorted, np.arange(V),
+        s=44, zorder=4,
+        facecolors="white", edgecolors="black", linewidths=1.2,
+        label="median",
+    )
+    ax.scatter(
+        mean_s, np.arange(V),
+        s=46, zorder=4,
+        marker="x", c="black", linewidths=1.6,
+        label="mean",
+    )
+
+
+    ax.set_yticks(np.arange(V))
+    ax.set_yticklabels(names_s)
+    ax.set_xlabel("Accuracy drop when scrambled")
+    ax.set_ylabel("feature")
+    ax.set_title(title)
+    ax.set_xlim(xmin, xmax)
+    _rid_style_ax(ax)
+    ax.legend(frameon=False, fontsize=9, loc="lower right")
+
+    fig.tight_layout()
+    if show:
+        plt.show()
+    return fig, ax
+
+
+def rid_plot_cdfs(
+    rid_out,
+    feature_names=None,
+    figsize=(10, 4.5),
+    ax=None,
+    title="RID CDFs (all features overlaid)",
+    cmap_name="tab20",
+    legend_ncol=5,
+    legend_fontsize=9,
+    show=True,
+):
+    cdf_x = rid_out["cdf_x"]
+    cdf_p = rid_out["cdf_p"]
+    mean = np.asarray(rid_out["mean_sub_mr"], dtype=float)
+
+    V = int(mean.size)
+    feature_names = _rid_feature_names(feature_names, V)
+
+    cdf_pairs = []
+    xmin, xmax = 0.0, 0.0
+    for j in range(V):
+        xs, ps = _rid_sorted_xy(cdf_x[j], cdf_p[j])
+        cdf_pairs.append((xs, ps))
+        if xs.size:
+            xmin = min(xmin, float(xs[0]))
+            xmax = max(xmax, float(xs[-1]))
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    cmap = get_cmap(cmap_name)
+    colors = [cmap(i % 20) for i in range(V)]
+
+    for j in range(V):
+        xs, ps = cdf_pairs[j]
+        if xs.size == 0:
+            continue
+        ax.plot(xs, ps, linewidth=1.8, alpha=0.9, color=colors[j], label=feature_names[j])
+
+    ax.set_title(title)
+    ax.set_xlabel("Accuracy drop when scrambled")
+    ax.set_ylabel("P[Δ accuracy ≤ t]")
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(-0.02, 1.02)
+    _rid_style_ax(ax)
+
+    ax.legend(
+        ncol=int(legend_ncol),
+        fontsize=float(legend_fontsize),
+        frameon=False,
+        handlelength=1.8,
+        columnspacing=1.1,
+    )
+
+    fig.tight_layout()
+    if show:
+        plt.show()
+    return fig, ax
+
 
