@@ -11,7 +11,7 @@ LicketyRESPLIT can generate millions of valid trees in seconds, orders of magnit
 If you have access to C++ build tools, you can install directly from GitHub:
 
 ```bash
-pip install "git+https://github.com/zakk-h/LicketyRESPLIT.git"
+pip install "git+https://github.com/zakk-h/LicketyRESPLIT.git@praxis"
 ```
 
 ### Prebuilt Binary Wheels
@@ -26,7 +26,7 @@ To make installation simpler, LicketyRESPLIT provides prebuilt binary wheels for
 
 #### Installation Steps
 
-1. Go to the release page: https://github.com/zakk-h/LicketyRESPLIT/releases/tag/v0.0.5
+1. Go to the release page: https://github.com/zakk-h/LicketyRESPLIT/releases/tag/praxis-v0.0.8
 
 2. Choose the wheel that matches:
    - Your Python version (cp39, cp310, cp311, cp312, cp313)
@@ -34,21 +34,11 @@ To make installation simpler, LicketyRESPLIT provides prebuilt binary wheels for
 
 3. Install it with pip (replace the URL with your chosen wheel file from step 2):
 
-**Windows, Python 3.12:**
-```bash
-pip install "https://github.com/zakk-h/LicketyRESPLIT/releases/download/v0.0.5/licketyresplit-0.0.5-cp312-cp312-win_amd64.whl"
-```
-
 **macOS (Apple Silicon), Python 3.11:**
 ```bash
-pip install "https://github.com/zakk-h/LicketyRESPLIT/releases/download/v0.0.5/licketyresplit-0.0.5-cp311-cp311-macosx_11_0_arm64.whl"
-```
-
-**Linux, Python 3.12:**
-```bash
-pip install "https://github.com/zakk-h/LicketyRESPLIT/releases/download/v0.0.5/licketyresplit-0.0.5-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"
+pip install "https://github.com/zakk-h/LicketyRESPLIT/releases/download/praxis-v0.0.8/praxis-0.0.8-cp311-cp311-macosx_11_0_arm64.whl"
 ```
 
 ## Example
 
-See [`examples/example.ipynb`](examples/example.ipynb) for a complete walkthrough of using LicketyRESPLIT.
+See [`examples/example.ipynb`](examples/example.ipynb) for a complete walkthrough of using PRAXIS.
