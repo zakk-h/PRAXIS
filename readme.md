@@ -1,8 +1,6 @@
-# LicketyRESPLIT: Fast Rashomon Set Approximation for Sparse Decision Trees
+# PRAXIS: Fast computation of near-optimal trees and the Rashomon set
 
-LicketyRESPLIT is a high-performance C++/Python library for rapidly enumerating all decision trees within a multiplier of the best tree (or reference solution).
-
-LicketyRESPLIT can generate millions of valid trees in seconds, orders of magnitude faster than other approaches.
+PRAXIS is a high-performance C++/Python library for decision tree optimization. It includes (i) single decision tree optimization (both heuristic and optimal), (ii) Rashomon set computation (both approximate and optimal), and (iii) model-agnostic variable importance computation via the Rashomon Importance Distribution (both approximate and exact). 
 
 ## Installation
 
