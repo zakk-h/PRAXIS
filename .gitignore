@@ -3,6 +3,7 @@
 
 # but allow this specific dataset for demo purposes
 !bike_binarized.csv
+!examples/compas_binarized.csv
 
 Ignore/
 
@@ -74,6 +75,7 @@ LicketyCPPOutput/
 LicketyCPPOutput_lk2/
 LicketyCPPOutput_lk3/
 MaybeUseful/
+Maybe Useful
 MultipassAblation/
 MultipassAblationNew/
 other_bootstraps/
