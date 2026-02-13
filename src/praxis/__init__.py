@@ -410,6 +410,86 @@ class PRAXIS:
     def rid_plot_cdfs(self, feature_names=None, **kwargs):
         rid_out = self._require_rid()
         return rid_plot_cdfs(rid_out, feature_names=feature_names, **kwargs)
+    
+    @staticmethod
+    def _require_binary_predictions(preds):
+        a = np.asarray(preds)
+        u = np.unique(a)
+        ok = np.all((u == 0) | (u == 1))
+        if not ok:
+            raise ValueError(f"We require predictions in {{0,1}}.")
+
+    def get_p_per_sample(self, X, tree_indices=None):
+        # returns p_i per sample, the proportion of models predicting 1 - require binary predicitons
+        # tree_indices : iterable[int] | None. if none, uses all trees, otherwise averages over the tree indices provided.
+       
+        X = np.asarray(X, dtype=np.uint8)
+
+        if tree_indices is None:
+            P = self.get_all_predictions(X, stack=True)
+        else:
+            idxs = list(tree_indices)
+            if len(idxs) == 0:
+                raise ValueError("tree_indices is empty.")
+            preds_list = [self.get_predictions(int(t), X) for t in idxs]
+            P = np.stack(preds_list, axis=0)
+
+        self._require_binary_predictions(P)
+
+        return P.mean(axis=0)
+
+    def get_variance_per_sample(self, X, tree_indices=None):
+        # returns per-sample variance of hard predictions across trees: p_i(1-p_i)
+        X = np.asarray(X, dtype=np.uint8)
+
+        if tree_indices is None:
+            P = self.get_all_predictions(X, stack=True)  # (T, N)
+        else:
+            idxs = list(tree_indices)
+            preds_list = [self.get_predictions(int(t), X) for t in idxs]
+            P = np.stack(preds_list, axis=0)
+
+        P = np.asarray(P)
+        self._require_binary_predictions(P)
+
+        return P.var(axis=0, ddof=0)
+
+    def get_avg_variance_across_samples(self, X, tree_indices=None):
+        v = self.get_variance_per_sample(X, tree_indices=tree_indices)
+        return float(np.mean(v))
+
+    def plot_disagreement_cdf(self, X, tree_indices=None, ax=None, figsize=(6.5, 4.0), title="Disagreement across samples", show=True, label=None):
+        # plots proportion of points where variance is at most threshold t.
+        v = self.get_variance_per_sample(X, tree_indices=tree_indices)
+        v = np.asarray(v, float)
+        n = v.size
+    
+        xs = np.sort(v)
+        F = (np.arange(1, n + 1, dtype=float) / float(n))
+
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        else:
+            fig = ax.figure
+
+        ax.step(xs, F, where="post", linewidth=2.0, label=label)
+        ax.set_ylabel("Proportion with var ≤ t")
+
+        ax.set_xlabel("Variance threshold t")
+        ax.set_ylim(-0.02, 1.02)
+        ax.set_title(title)
+
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.grid(True, alpha=0.25)
+
+        if label is not None:
+            ax.legend(frameon=False)
+
+        fig.tight_layout()
+        if show:
+            plt.show()
+        return fig, ax
 
 def _rid_style_ax(ax):
     ax.spines["top"].set_visible(False)
@@ -635,5 +715,7 @@ def rid_plot_cdfs(
     if show:
         plt.show()
     return fig, ax
+
+
 
 
