@@ -6,18 +6,108 @@ from matplotlib.cm import get_cmap
 from ._core import PRAXIS as _PRAXISCore, rid_subtractive_model_reliance as _rid_subtractive_core
 from ._threshold_guessing import ThresholdGuessBinarizer
 
-# __all__ = ["PRAXIS"]
-#__all__ = ["PRAXIS", "RashomonImportanceDistribution", "ThresholdGuessBinarizer"]
 __all__ = ["PRAXIS", "ThresholdGuessBinarizer"]
 
-# def RashomonImportanceDistribution(X, y, n_boot=10, lambda_reg=0.01, depth_budget=5, rashomon_mult=0.03, lookahead_k=1, seed=0, memory_efficient=False, binning_map=None):
-#     X = np.asarray(X, dtype=np.uint8)
-#     y = np.asarray(y, dtype=int)
-#     return _rid_subtractive_core(X, y, int(n_boot), float(lambda_reg), int(depth_budget), float(rashomon_mult), int(lookahead_k), int(seed), bool(memory_efficient), binning_map)
+def _normalize_key(s: str) -> str:
+    # lower, trim, and make separators uniform
+    s = str(s).strip().lower()
+    s = s.replace("-", "_").replace(" ", "_")
+    # collapse repeats
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s
+
+_PROXY_STYLE_MAP = {
+    # explicit canonical names
+    "recursively_choose_best_split": 0,
+    "block_split": 1,
+    "split_without_postprocessing": 3,
+
+    # synonyms
+    "licketysplit": 0,
+    "lickety_split": 0,
+    "lickety": 0,
+    "greedy": 0,
+    "default": 0,
+    "recursive": 0,
+    "recursively_choose": 0,
+    "choose_best_split": 0,
+
+    "block": 1,
+    "cyclic": 1,
+    "cyclic_k": 1,
+
+    "no_postprocessing": 3,
+    "no_postprocess": 3,
+    "without_postprocessing": 3,
+    "split_no_postprocessing": 3,
+    "split": 3,
+}
+
+
+def parse_proxy_style(proxy_style):
+    # accepts int or string
+    if isinstance(proxy_style, (int, np.integer)):
+        v = int(proxy_style)
+        if v in (0, 1, 3):
+            return v
+        raise ValueError(
+            f"proxy_style={v} is not supported. "
+            f"Supported oracle styles are 0, 1, 3."
+        )
+
+    key = _normalize_key(proxy_style)
+    if key in _PROXY_STYLE_MAP:
+        return _PROXY_STYLE_MAP[key]
+
+    allowed = sorted(set(_PROXY_STYLE_MAP.keys()))
+    raise ValueError(
+        f"Unknown proxy_style='{proxy_style}'. "
+        f"Supported: oracle_style 0/1/3, or one of: {allowed}"
+    )
+
+_GREEDY_HEURISTIC_MAP = {
+    "entropy": 0,
+    "info_gain": 0,
+    "information_gain": 0,
+    "ig": 0,
+
+    "entropy_depth1_exact": 1,
+    "entropy_with_depth1_exact": 1,
+    "depth1_exact": 1,
+    "default": 1,
+
+    "best_split_for_leaves": 2,
+    "min_child_leaf_objective": 2,
+    "min_child_objective": 2,
+    "always_misclassification_minimizing": 2,
+    "misclassification_minimizing": 2,
+    "misclassification_based": 2,
+}
+
+
+def parse_heuristic_for_greedy(heuristic_for_greedy):
+    # accepts int or string
+    if isinstance(heuristic_for_greedy, (int, np.integer)):
+        v = int(heuristic_for_greedy)
+        if v in (0, 1, 2):
+            return v
+        raise ValueError(
+            f"heuristic_for_greedy={v} is invalid. Supported: 0,1,2."
+        )
+
+    key = _normalize_key(heuristic_for_greedy)
+    if key in _GREEDY_HEURISTIC_MAP:
+        return _GREEDY_HEURISTIC_MAP[key]
+
+    allowed = sorted(set(_GREEDY_HEURISTIC_MAP.keys()))
+    raise ValueError(
+        f"Unknown heuristic_for_greedy='{heuristic_for_greedy}'. "
+        f"Supported: 0/1/2, or one of: {allowed}"
+    )
 
 class PRAXIS:
     def __init__(self):
-        # self._model = _core.PRAXIS()
         self._model = _PRAXISCore()
         self._rid_out = None
 
@@ -30,21 +120,23 @@ class PRAXIS:
         rashomon_mult=0.01,
         multiplicative_slack=0.0,
         key_mode="hash",
-        trie_cache_enabled=False,
         lookahead_k=1,
-        oracle_style=0, 
-        root_budget=None, # be weary - expected integerized already
-        use_multipass=True, 
-        rule_list_mode=False,
+        proxy_style=0, 
+        root_budget=None, 
+        use_budget_refinement=True, 
+        guarantee_rule_list_recovery=False,
         majority_leaf_only=False,
-        cache_cheap_subproblems=False,
-        greedy_split_mode=1,
+        cache_early_exits=False,
+        heuristic_for_greedy=1,
         proxy_caching=True,
         num_proxy_features=0,
         rashomon_mode=True,
     ):
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=int)
+
+        proxy_style_int = parse_proxy_style(proxy_style)
+        greedy_heur_int = parse_heuristic_for_greedy(heuristic_for_greedy)
         
         if root_budget is None:
             root_budget_int = -1
@@ -58,15 +150,15 @@ class PRAXIS:
             rashomon_mult,
             multiplicative_slack,
             key_mode,
-            trie_cache_enabled,
+            False,
             lookahead_k,
             root_budget_int,
-            bool(use_multipass), 
-            bool(rule_list_mode), 
-            int(oracle_style), 
+            bool(use_budget_refinement), 
+            bool(guarantee_rule_list_recovery), 
+            int(proxy_style_int), 
             bool(majority_leaf_only),
-            bool(cache_cheap_subproblems),
-            int(greedy_split_mode),
+            bool(cache_early_exits),
+            int(heuristic_for_greedy),
             bool(proxy_caching),
             int(num_proxy_features),
             bool(rashomon_mode),

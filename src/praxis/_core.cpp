@@ -65,7 +65,7 @@ PYBIND11_MODULE(_core, m) {
                 std::vector<int> y_vec(y_ptr, y_ptr + n_samples);
 
                 PRAXIS::KeyMode km;
-                if (key_mode_str == "exact") {
+                if (key_mode_str == "exact" || key_mode_str == "bitvector") {
                     km = PRAXIS::KeyMode::EXACT;
                 } else if (key_mode_str == "literal" || key_mode_str == "lits" || key_mode_str == "lits_exact" || key_mode_str == "itemset") {
                     km = PRAXIS::KeyMode::LITS_EXACT;
@@ -280,16 +280,6 @@ PYBIND11_MODULE(_core, m) {
                 return py::make_tuple(py_paths, py_preds);
             },
             py::arg("tree_index")
-        )
-
-        .def(
-            "get_tree_frontier_scores",
-            [](PRAXIS &self, std::uint64_t tree_index, int depth_budget) {
-                auto vec = self.get_tree_frontier_scores(tree_index, depth_budget);
-                return vec;
-            },
-            py::arg("tree_index"),
-            py::arg("depth_budget")
         )
 
         .def(
