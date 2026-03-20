@@ -375,7 +375,7 @@ class PRAXIS:
                 r_child = leaf_r if node.left.prediction is not None else internal_r
 
                 sx, sy, ex, ey = _shrink_segment(x, y, x2, y2, r_parent, r_child)
-                ax.add_line(Line2D([sx, ex], [sy, ey], color="black", linewidth=2.2))
+                ax.add_line(Line2D([sx, ex], [sy, ey], color="#4D4D4D", linewidth=2.2))
                 
                 # if node.feature is not None and node.prediction is None:
                 #     tx, ty = _edge_label_pos(x, y, x2, y2, frac=0.52, base_offset=0.28, side_sign=+1.0)
@@ -394,7 +394,7 @@ class PRAXIS:
                 r_child = leaf_r if node.right.prediction is not None else internal_r
 
                 sx, sy, ex, ey = _shrink_segment(x, y, x2, y2, r_parent, r_child)
-                ax.add_line(Line2D([sx, ex], [sy, ey], color="black", linewidth=2.2))
+                ax.add_line(Line2D([sx, ex], [sy, ey], color="#4D4D4D", linewidth=2.2))
 
                 # if node.feature is not None and node.prediction is None:
                 #     tx, ty = _edge_label_pos(x, y, x2, y2, frac=0.52, base_offset=0.28, side_sign=-1.0)
@@ -408,31 +408,57 @@ class PRAXIS:
 
             # draw node
             if node.prediction is None:
-                # internal node: unlabeled
-                face = "#ddeeff"
+                face = "#DCEAF4"
+                edge = "#4D4D4D"
+                text_color = "#222222"
                 radius = internal_r
                 label = None
             else:
-                # leaf node: prediction label
-                face = "#e0ffd8"
+                if int(node.prediction) == 0:
+                    face = "#E69F00"
+                else:
+                    face = "#009E73"
+                edge = "#4D4D4D"
+                text_color = "#111111"
                 radius = leaf_r
                 label = str(node.prediction)
 
-            circ = Circle((x, y), radius, facecolor=face, edgecolor="black", linewidth=1.6)
+                edge = "#4D4D4D"
+                text_color = "#111111"
+                radius = leaf_r
+                label = str(node.prediction)
+
+            circ = Circle(
+                (x, y),
+                radius,
+                facecolor=face,
+                edgecolor=edge,
+                linewidth=1.6
+            )
             ax.add_patch(circ)
+
             if node.prediction is None and node.feature is not None:
                 # feature name above internal node
                 ax.text(
                     x, y + radius + 0.22,
                     feature_names[node.feature],
-                    ha="center", va="bottom", fontsize=11,
-                    bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.9),
+                    ha="center", va="bottom",
+                    fontsize=11,
+                    color="#222222",
+                    bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.95),
                     zorder=10,
                 )
 
             if label is not None:
-                ax.text(x, y, label, ha="center", va="center", fontsize=12, fontweight="bold", zorder=10)
-
+                ax.text(
+                    x, y,
+                    label,
+                    ha="center", va="center",
+                    fontsize=12,
+                    fontweight="bold",
+                    color="white",
+                    zorder=10,
+                )
         draw_node(root)
 
         xs, ys = zip(*positions.values())
