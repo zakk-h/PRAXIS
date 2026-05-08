@@ -960,10 +960,33 @@ private:
         auto node = make_shared<TreeTrieNode>(); // wraps in shared pointer so memory management is automatic
         node->budget = budget;
 
-        const int n_sub = count_total(mask);
+        int n_sub = 0;
 
-        // braces make temporary local scope so variables created will cease to persist
-        {
+        if (num_classes == 2) {
+            int pos = 0;
+            count_total_pos_binary(mask, n_sub, pos);
+
+            if (!majority_leaf_only) {
+                // predict 0: mistakes are positives
+                const int cost0 = gamma + pos;
+
+                // predict 1: mistakes are negatives
+                const int cost1 = gamma + (n_sub - pos);
+
+                if (cost0 <= budget) node->add_leaf(0, cost0);
+                if (cost1 <= budget) node->add_leaf(1, cost1);
+            } else {
+                // choose majority class; tie breaks toward class 1
+                const int neg = n_sub - pos;
+                const int best_c = (pos >= neg) ? 1 : 0;
+                const int mis = std::min(pos, neg);
+                const int best_cost = gamma + mis;
+
+                if (best_cost <= budget) node->add_leaf(best_c, best_cost);
+            }
+        } else {
+            n_sub = count_total(mask);
+
             std::vector<int> cnts;
             count_per_class(mask, cnts);
 
@@ -974,7 +997,7 @@ private:
                     if (cost <= budget) node->add_leaf(c, cost);
                 }
             } else {
-                // choose argmax class 
+                // choose argmax class
                 int best_c = 0;
                 int best_cnt = cnts[0];
                 for (int c = 1; c < num_classes; ++c) {
@@ -984,12 +1007,12 @@ private:
                         best_c = c;
                     }
                 }
+
                 const int mis = n_sub - best_cnt;
                 const int best_cost = gamma + mis;
                 if (best_cost <= budget) node->add_leaf(best_c, best_cost);
             }
         }
-
 
         if (depth == 0 || budget < 2 * gamma) {
             if (trie_cache_enabled) trie_cache.emplace(key, node);
@@ -1155,7 +1178,30 @@ private:
     
     }
 
+    inline void count_total_pos_binary(const Packed& mask, int& n, int& pos) const {
+        n = 0;
+        pos = 0;
+
+        // class 1 is the positive class
+        const Packed& Ypos = Y_bits[(size_t)1];
+
+        for (int i = 0; i < n_words; ++i) {
+            const uint64_t mw = mask.w[(size_t)i];
+            n   += popcnt64(mw);
+            pos += popcnt64(mw & Ypos.w[(size_t)i]);
+        }
+    }
+
     int leaf_objective(const Packed& mask) const {
+        if (num_classes == 2) {
+            int n_sub, pos;
+            count_total_pos_binary(mask, n_sub, pos);
+
+            if (n_sub == 0) return 0;
+
+            return gamma + std::min(pos, n_sub - pos);
+        }
+
         const int n_sub = count_total(mask);
         if (n_sub == 0) return 0;
 
@@ -1187,6 +1233,11 @@ private:
         }
     }
 
+    inline int leaf_objective_binary_from_counts(int n_sub, int pos) const {
+        if (n_sub == 0) return 0;
+        return gamma + std::min(pos, n_sub - pos);
+    }
+
 
     int train_greedy(const Packed& mask, int8_t depth_budget, const PathKey& pk) {
         if (depth_budget == 0) {
@@ -1205,11 +1256,22 @@ private:
             if (auto it = greedy_cache.find(key); it != greedy_cache.end()) return it->second; // the objective of the tree returned by the proxy
         }
 
-        const int leaf_loss = leaf_objective(mask);
+        int n_sub = 0;
+        int pos = 0;
+        int leaf_loss = 0;
+
+        if (num_classes == 2) {
+            count_total_pos_binary(mask, n_sub, pos);
+            leaf_loss = leaf_objective_binary_from_counts(n_sub, pos);
+        } else {
+            n_sub = count_total(mask);
+            leaf_loss = leaf_objective(mask);
+        }
 
         if (leaf_loss <= 2 * gamma) {
-            if (cache_cheap_subproblems && proxy_caching_enabled) 
+            if (cache_cheap_subproblems && proxy_caching_enabled) {
                 greedy_cache.emplace(key, leaf_loss);
+            }
             return leaf_loss;
         }
 
@@ -1225,7 +1287,12 @@ private:
 
 
         // choose split via entropy gain
-        int best_feat = find_best_split(mask, use_entropy);
+        int best_feat;
+        if (num_classes == 2) {
+            best_feat = find_best_split_binary_known_counts(mask, n_sub, pos, use_entropy);
+        } else {
+            best_feat = find_best_split(mask, use_entropy);
+        }
         if (best_feat < 0) {
             if (proxy_caching_enabled) greedy_cache.emplace(key, leaf_loss);
             return leaf_loss;
@@ -1264,6 +1331,25 @@ private:
         return (k > 1) ? (k - 1) : lookahead_init;
     }
 
+    inline void split_bits_count_left(
+        const Packed& mask,
+        const Packed& Xf,
+        Packed& L,
+        Packed& R,
+        int& left_n
+    ) const {
+        left_n = 0;
+        for (int i = 0; i < n_words; ++i) {
+            const uint64_t mw = mask.w[(size_t)i];
+            const uint64_t lw = mw & Xf.w[(size_t)i];
+            L.w[(size_t)i] = lw;
+            R.w[(size_t)i] = mw & ~Xf.w[(size_t)i];
+            left_n += popcnt64(lw);
+        }
+        L.w[(size_t)(n_words - 1)] &= tail_mask;
+        R.w[(size_t)(n_words - 1)] &= tail_mask;
+    }
+
     int depth1_exact_solver_cached(const Packed& mask, const PathKey& pk) {
         // const uint64_t kmask = key_of_subproblem(mask, pk);
         // constexpr int DEPTH = 1;
@@ -1281,6 +1367,57 @@ private:
         if (proxy_caching_enabled) {
             kmask = key_of_subproblem(mask, pk);
             if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) return cached;
+        }
+
+        if (num_classes == 2) {
+            int n_sub, pos_total;
+            count_total_pos_binary(mask, n_sub, pos_total);
+
+            const int leaf_loss = leaf_objective_binary_from_counts(n_sub, pos_total);
+
+            // only cache cheap subproblems if flag enabled
+            if (leaf_loss <= 2 * gamma) {
+                if (proxy_caching_enabled) {
+                    cache_lickety_if_true_(kmask, DEPTH, KTAG, leaf_loss,/*allow_cache=*/cache_cheap_subproblems);
+                }
+                return leaf_loss;
+            }
+
+            int best_sum = std::numeric_limits<int>::max();
+
+            const Packed& Ypos = Y_bits[(size_t)1];
+            const int F = proxy_feat_count_();
+
+            for (int f = 0; f < F; ++f) {
+                const Packed& Xf = X_bits[(size_t)f];
+
+                int left_n = 0;
+                int left_pos = 0;
+
+                for (int i = 0; i < n_words; ++i) {
+                    const uint64_t lw = mask.w[(size_t)i] & Xf.w[(size_t)i];
+                    left_n   += popcnt64(lw);
+                    left_pos += popcnt64(lw & Ypos.w[(size_t)i]);
+                }
+
+                const int right_n = n_sub - left_n;
+                if (left_n == 0 || right_n == 0) continue;
+
+                const int right_pos = pos_total - left_pos;
+
+                const int sum =
+                    leaf_objective_binary_from_counts(left_n, left_pos)
+                    +
+                    leaf_objective_binary_from_counts(right_n, right_pos);
+
+                if (sum < best_sum) best_sum = sum;
+            }
+
+            int ans = leaf_loss;
+            if (best_sum != std::numeric_limits<int>::max()) ans = std::min(ans, best_sum);
+
+            if (proxy_caching_enabled) cache_lickety_if_true_(kmask, DEPTH, KTAG, ans, /*allow_cache=*/true);
+            return ans;
         }
 
         const int leaf_loss = leaf_objective(mask);
@@ -1326,7 +1463,17 @@ private:
             if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) return cached;
         }
 
-        const int leaf_loss = leaf_objective(mask);
+        int n_sub = 0;
+        int pos = 0;
+        int leaf_loss = 0;
+
+        if (num_classes == 2) {
+            count_total_pos_binary(mask, n_sub, pos);
+            leaf_loss = leaf_objective_binary_from_counts(n_sub, pos);
+        } else {
+            n_sub = count_total(mask);
+            leaf_loss = leaf_objective(mask);
+        }
 
         if (leaf_loss <= 2 * gamma) {
             if (proxy_caching_enabled) {
@@ -1340,9 +1487,15 @@ private:
         Packed L(n_words), R(n_words);
         const int F = proxy_feat_count_();
         for (int f = 0; f < F; ++f) {
-            and_bits(mask, X_bits[f], L);
-            andnot_bits(mask, X_bits[f], R);
-            if (!L.any() || !R.any()) continue;
+            if (num_classes == 2) {
+                int left_n = 0;
+                split_bits_count_left(mask, X_bits[f], L, R, left_n);
+                if (left_n == 0 || left_n == n_sub) continue;
+            } else {
+                and_bits(mask, X_bits[f], L);
+                andnot_bits(mask, X_bits[f], R);
+                if (!L.any() || !R.any()) continue;
+            }
 
             const PathKey* pkLp = &empty_pk();
             const PathKey* pkRp = &empty_pk();
@@ -1369,7 +1522,7 @@ private:
         if (depth_budget == 2) return depth2_special_solver_cached(mask, pk);
 
         const int8_t DEPTH = depth_budget;
-        const int8_t  KTAG  = depth_budget - 1;
+        const int8_t KTAG  = depth_budget - 1;
 
 
         uint64_t kmask = 0;
@@ -1380,7 +1533,17 @@ private:
             if (try_get_lickety_cached_(kmask, DEPTH, KTAG, cached)) return cached;
         }
 
-        const int leaf_loss = leaf_objective(mask);
+        int n_sub = 0;
+        int pos = 0;
+        int leaf_loss = 0;
+
+        if (num_classes == 2) {
+            count_total_pos_binary(mask, n_sub, pos);
+            leaf_loss = leaf_objective_binary_from_counts(n_sub, pos);
+        } else {
+            n_sub = count_total(mask);
+            leaf_loss = leaf_objective(mask);
+        }
 
         if (leaf_loss <= 2 * gamma) {
             if (proxy_caching_enabled) {
@@ -1394,9 +1557,15 @@ private:
         Packed L(n_words), R(n_words);
         const int F = proxy_feat_count_();
         for (int f = 0; f < F; ++f) {
-            and_bits(mask, X_bits[f], L);
-            andnot_bits(mask, X_bits[f], R);
-            if (!L.any() || !R.any()) continue;
+            if (num_classes == 2) {
+                int left_n = 0;
+                split_bits_count_left(mask, X_bits[f], L, R, left_n);
+                if (left_n == 0 || left_n == n_sub) continue;
+            } else {
+                and_bits(mask, X_bits[f], L);
+                andnot_bits(mask, X_bits[f], R);
+                if (!L.any() || !R.any()) continue;
+            }
 
             const PathKey* pkLp = &empty_pk();
             const PathKey* pkRp = &empty_pk();
@@ -1596,7 +1765,6 @@ private:
         }
 
         if (best_feat >= 0) {
-            Packed bestL(n_words), bestR(n_words);
             and_bits(mask, X_bits[best_feat], bestL);
             andnot_bits(mask, X_bits[best_feat], bestR);
         }
@@ -1732,8 +1900,181 @@ private:
         return left_cost + right_cost;
     }
 
+    int find_best_split_binary_known_counts(
+        const Packed& mask,
+        int n_sub,
+        int pos_total,
+        bool use_entropy
+    ) const {
+        if (n_sub <= 1) return -1;
+
+        const Packed& Ypos = Y_bits[(size_t)1];
+
+        int best_f = -1;
+        const int F = proxy_feat_count_();
+
+        if (use_entropy) {
+            double best_score = 1e300;
+
+            for (int f = 0; f < F; ++f) {
+                int left_n = 0;
+                int left_pos = 0;
+
+                const Packed& Xf = X_bits[(size_t)f];
+
+                for (int i = 0; i < n_words; ++i) {
+                    const uint64_t lw = mask.w[(size_t)i] & Xf.w[(size_t)i];
+                    left_n   += popcnt64(lw);
+                    left_pos += popcnt64(lw & Ypos.w[(size_t)i]);
+                }
+
+                const int right_n = n_sub - left_n;
+                if (left_n == 0 || right_n == 0) continue;
+
+                const int right_pos = pos_total - left_pos;
+
+                const double wl = (double)left_n  / (double)n_sub;
+                const double wr = (double)right_n / (double)n_sub;
+
+                const double pl = (double)left_pos  / (double)left_n;
+                const double pr = (double)right_pos / (double)right_n;
+
+                const double score = wl * entropy(pl) + wr * entropy(pr);
+
+                if (score < best_score) {
+                    best_score = score;
+                    best_f = f;
+                }
+            }
+
+            return best_f;
+        } else {
+            int best_sum = std::numeric_limits<int>::max();
+
+            for (int f = 0; f < F; ++f) {
+                int left_n = 0;
+                int left_pos = 0;
+
+                const Packed& Xf = X_bits[(size_t)f];
+
+                for (int i = 0; i < n_words; ++i) {
+                    const uint64_t lw = mask.w[(size_t)i] & Xf.w[(size_t)i];
+                    left_n   += popcnt64(lw);
+                    left_pos += popcnt64(lw & Ypos.w[(size_t)i]);
+                }
+
+                const int right_n = n_sub - left_n;
+                if (left_n == 0 || right_n == 0) continue;
+
+                const int right_pos = pos_total - left_pos;
+
+                const int left_loss =
+                    leaf_objective_binary_from_counts(left_n, left_pos);
+
+                const int right_loss =
+                    leaf_objective_binary_from_counts(right_n, right_pos);
+
+                const int sum = left_loss + right_loss;
+
+                if (sum < best_sum) {
+                    best_sum = sum;
+                    best_f = f;
+                }
+            }
+
+            return best_f;
+        }
+    }
+
+    int find_best_split_binary(const Packed& mask, bool use_entropy) const {
+        int n_sub, pos_total;
+        count_total_pos_binary(mask, n_sub, pos_total);
+
+        if (n_sub <= 1) return -1;
+
+        const Packed& Ypos = Y_bits[(size_t)1];
+
+        int best_f = -1;
+        const int F = proxy_feat_count_();
+
+        if (use_entropy) {
+            double best_score = 1e300;
+
+            for (int f = 0; f < F; ++f) {
+                int left_n = 0;
+                int left_pos = 0;
+
+                const Packed& Xf = X_bits[(size_t)f];
+
+                for (int i = 0; i < n_words; ++i) {
+                    const uint64_t lw = mask.w[(size_t)i] & Xf.w[(size_t)i];
+                    left_n   += popcnt64(lw);
+                    left_pos += popcnt64(lw & Ypos.w[(size_t)i]);
+                }
+
+                const int right_n = n_sub - left_n;
+                if (left_n == 0 || right_n == 0) continue;
+
+                const int right_pos = pos_total - left_pos;
+
+                const double wl = (double)left_n  / (double)n_sub;
+                const double wr = (double)right_n / (double)n_sub;
+
+                const double pl = (double)left_pos  / (double)left_n;
+                const double pr = (double)right_pos / (double)right_n;
+
+                const double score = wl * entropy(pl) + wr * entropy(pr);
+
+                if (score < best_score) {
+                    best_score = score;
+                    best_f = f;
+                }
+            }
+
+            return best_f;
+        } else {
+            int best_sum = std::numeric_limits<int>::max();
+
+            for (int f = 0; f < F; ++f) {
+                int left_n = 0;
+                int left_pos = 0;
+
+                const Packed& Xf = X_bits[(size_t)f];
+
+                for (int i = 0; i < n_words; ++i) {
+                    const uint64_t lw = mask.w[(size_t)i] & Xf.w[(size_t)i];
+                    left_n   += popcnt64(lw);
+                    left_pos += popcnt64(lw & Ypos.w[(size_t)i]);
+                }
+
+                const int right_n = n_sub - left_n;
+                if (left_n == 0 || right_n == 0) continue;
+
+                const int right_pos = pos_total - left_pos;
+
+                const int left_loss =
+                    gamma + std::min(left_pos, left_n - left_pos);
+
+                const int right_loss =
+                    gamma + std::min(right_pos, right_n - right_pos);
+
+                const int sum = left_loss + right_loss;
+
+                if (sum < best_sum) {
+                    best_sum = sum;
+                    best_f = f;
+                }
+            }
+
+            return best_f;
+        }
+    }
+
 
     int find_best_split(const Packed& mask, bool use_entropy) const {
+        if (num_classes == 2) {
+            return find_best_split_binary(mask, use_entropy);
+        }
         const int n_sub = count_total(mask);
         if (n_sub <= 1) return -1;
 
