@@ -5,15 +5,34 @@ import pybind11
 
 
 class BuildExt(build_ext):
+    # c_opts = {
+    #     "msvc": ["/O2", "/std:c++17"],
+    #     "unix": ["-O3", "-DNDEBUG", "-funroll-loops"],
+    # }
+
+
+    # l_opts = {
+    #     "msvc": [],
+    #     "unix": [],
+    # }
+
     c_opts = {
         "msvc": ["/O2", "/std:c++17"],
-        "unix": ["-O3", "-DNDEBUG", "-funroll-loops"],
+        "unix": [
+            "-O3",
+            "-DNDEBUG",
+            "-funroll-loops",
+            "-flto",
+            "-mpopcnt",
+            "-mbmi",
+            "-mbmi2",
+            "-mavx2",
+        ],
     }
-
 
     l_opts = {
         "msvc": [],
-        "unix": [],
+        "unix": ["-flto", "-lm"],
     }
 
     def build_extensions(self):
@@ -31,12 +50,12 @@ class BuildExt(build_ext):
             opts += [
                 "-march=core-avx-i",
                 "-mtune=generic",
-                "-flto",
+                # "-flto",
             ]
-            link_opts += [
-                "-flto",
-                "-lm",
-            ]
+            # link_opts += [
+            #     "-flto",
+            #     "-lm",
+            # ]
             print("** Building PRAXIS with additional flags")
         elif aggressive and ct != "unix":
             print("Non-unix compiler detected; using safe flags.")
