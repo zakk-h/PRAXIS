@@ -1,6 +1,6 @@
 # PRAXIS: Fast computation of near-optimal trees and the Rashomon set
 
-PRAXIS is a high-performance C++/Python library for decision tree optimization. It includes (i) single decision tree optimization (both heuristic and optimal), (ii) Rashomon set computation (both approximate and optimal), and (iii) model-agnostic variable importance computation via the Rashomon Importance Distribution (both approximate and exact). 
+PRAXIS is a high-performance C++/Python library for decision tree optimization. It includes (i) single decision tree optimization (both heuristic and optimal), (ii) Rashomon set computation (both approximate and optimal), and (iii)  variable importance computation over all good models via the Rashomon Importance Distribution (both approximate and exact). 
 
 ## Installation
 
