@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-2022, macos-13, macos-14]
+        os: [ubuntu-22.04, windows-2022, macos-15-intel, macos-15]
 
     steps:
       - uses: actions/checkout@v4
@@ -38,11 +38,10 @@ jobs:
           # Windows
           CIBW_ARCHS_WINDOWS: "AMD64"
 
-          # macos-13 is Intel; macos-14 is Apple Silicon.
-          # Let each runner build its native arch.
+          # MacOS Intel and Apple Silicon.
           CIBW_ARCHS_MACOS: "auto"
 
-          # Basic smoke test inside each wheel build.
+
           CIBW_TEST_COMMAND: "python -c \"from praxis import PRAXIS, ThresholdGuessBinarizer; print('import ok')\""
 
         run: python -m cibuildwheel --output-dir wheelhouse
