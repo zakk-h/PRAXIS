@@ -106,6 +106,75 @@ def parse_heuristic_for_greedy(heuristic_for_greedy):
         f"Supported: 0/1/2, or one of: {allowed}"
     )
 
+def _validate_binary_X(X):
+    X_arr = np.asarray(X)
+
+    if X_arr.ndim != 2:
+        raise ValueError(
+            f"X must be a 2D array of binary features with shape (n_samples, n_features). "
+            f"Got shape {X_arr.shape}."
+        )
+
+    if X_arr.size == 0:
+        raise ValueError("X must be non-empty.")
+
+    bad_mask = ~((X_arr == 0) | (X_arr == 1))
+    if np.any(bad_mask):
+        bad_vals = np.unique(X_arr[bad_mask])
+        shown = bad_vals[:10]
+        raise ValueError(
+            "PRAXIS expects X to already be binary, with entries only in {0, 1}. "
+            f"Found non-binary values such as {shown}. "
+            "For continuous, ordinal, or categorical features, use ThresholdGuessBinarizer "
+            "first to convert X into binary threshold features."
+        )
+
+    return np.asarray(X_arr, dtype=np.uint8)
+
+
+def _validate_class_labels(y):
+    y_arr = np.asarray(y)
+
+    if y_arr.ndim != 1:
+        raise ValueError(
+            f"y must be a 1D array of class labels. Got shape {y_arr.shape}."
+        )
+
+    if y_arr.size == 0:
+        raise ValueError("y must be non-empty.")
+
+    if not np.issubdtype(y_arr.dtype, np.integer):
+        # allow floats only if they are exactly integer-valued
+        if np.issubdtype(y_arr.dtype, np.floating) and np.all(np.isfinite(y_arr)) and np.all(y_arr == np.floor(y_arr)):
+            y_arr = y_arr.astype(int)
+        else:
+            raise ValueError(
+                "PRAXIS expects y to contain integer class labels numbered "
+                "0, 1, ..., num_classes - 1. "
+                f"Got dtype {y_arr.dtype}. Please renumber your classes before fitting."
+            )
+
+    y_arr = np.asarray(y_arr, dtype=int)
+    classes = np.unique(y_arr)
+
+    if classes[0] < 0:
+        raise ValueError(
+            "PRAXIS expects y labels to be numbered 0, 1, ..., num_classes - 1. "
+            f"Found negative label(s): {classes[classes < 0]}. "
+            "Please renumber your classes before fitting."
+        )
+
+    expected = np.arange(classes.size)
+    if not np.array_equal(classes, expected):
+        raise ValueError(
+            "PRAXIS expects y labels to be consecutive integers numbered "
+            "0, 1, ..., num_classes - 1. "
+            f"Found labels {classes}, but expected {expected}. "
+            "Please renumber your classes before fitting."
+        )
+
+    return y_arr
+
 class PRAXIS:
     def __init__(self):
         self._model = _PRAXISCore()
@@ -130,13 +199,21 @@ class PRAXIS:
         heuristic_for_greedy=1,
         proxy_caching=True,
         num_proxy_features=0,
-        rashomon_mode=True,
+        proxy_only=False,
     ):
-        X = np.asarray(X, dtype=np.uint8)
-        y = np.asarray(y, dtype=int)
+        X = _validate_binary_X(X)
+        y = _validate_class_labels(y)
+
+        if X.shape[0] != y.shape[0]:
+            raise ValueError(
+                f"X and y must have the same number of samples. "
+                f"Got X.shape[0]={X.shape[0]} and y.shape[0]={y.shape[0]}."
+            )
 
         proxy_style_int = parse_proxy_style(proxy_style)
         greedy_heur_int = parse_heuristic_for_greedy(heuristic_for_greedy)
+        
+        rashomon_mode = not bool(proxy_only)
         
         if root_budget is None:
             root_budget_int = -1
@@ -158,7 +235,7 @@ class PRAXIS:
             int(proxy_style_int), 
             bool(majority_leaf_only),
             bool(cache_early_exits),
-            int(heuristic_for_greedy),
+            int(greedy_heur_int),
             bool(proxy_caching),
             int(num_proxy_features),
             bool(rashomon_mode),
