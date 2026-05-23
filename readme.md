@@ -1,26 +1,35 @@
 # PRAXIS: Fast Rashomon Sets for Sparse Decision Trees
 
-## Installation
+## Installation and Usage
 
 ```bash
 pip install tree-praxis
 ```
 
+See [`examples/example.ipynb`](https://github.com/zakk-h/PRAXIS/blob/praxis/examples/example.ipynb) for a complete walkthrough of using the code.
+
+
 ## What PRAXIS does
 
 This code creates **Rashomon sets of decision trees**. The Rashomon set is the set of all almost-optimal models.
 
-PRAXIS is designed to enumerate the Rashomon set for **sparse decision trees**. In other words, instead of returning a single optimal decision tree, it returns a set of decision trees whose objective values are all within a small factor of the best tree found. The objective is:
+
+PRAXIS is designed to enumerate the Rashomon set for **sparse decision trees**. In other words, instead of returning a single optimal decision tree, it returns a set of decision trees whose objective values are all within a small factor of the best tree found. For a decision tree `T`, PRAXIS uses the objective:
 
 ```text
-misclassifications + lambda_reg * n_samples * number_of_leaves.
+L(T) = misclassifications(T)
+     + lambda_reg * n_samples * number_of_leaves(T)
 ```
 
-This is useful when there are many decision trees with nearly the same accuracy. Rather than pretending there is one uniquely best tree, PRAXIS lets you inspect, count, compare, and make predictions with all good trees.
+The **Rashomon set** is the set of all trees whose objective is within a multiplicative factor of a reference objective value. If `T_reference` is a reference tree, then for a given `rashomon_mult`, PRAXIS enumerates trees satisfying:
 
-See [`examples/example.ipynb`](https://github.com/zakk-h/PRAXIS/blob/praxis/examples/example.ipynb) for a complete walkthrough of using the code.
+```text
+L(T) <= (1 + rashomon_mult) * L(T_reference)
+```
 
-To learn more about the algorithmic ideas behind PRAXIS, please see our ICML 2026 paper. At a high level, PRAXIS uses a proxy algorithm to estimate the best achievable objective within each subproblem, and then refines these estimates as enumeration proceeds. When the proxy algorithm is exact, PRAXIS performs exact Rashomon set enumeration. When the proxy is approximate, PRAXIS can trade a small amount of empirical approximation quality for substantially faster runtime.
+To learn more about the algorithmic ideas behind PRAXIS, please see our ICML 2026 paper. At a high level, PRAXIS uses a proxy algorithm to estimate the best achievable objective within each subproblem and uses it to set L(T_reference), and then refines these estimates as enumeration proceeds. When the proxy algorithm is exact, PRAXIS performs exact Rashomon set enumeration, finding all trees with L(T) <= (1 + rashomon_mult) * L(T_opt), where T_opt is a tree that minimizes the objective. When the proxy is approximate, PRAXIS can trade a small amount of empirical approximation quality for substantially faster runtime.
+
+
 
 PRAXIS also includes tools for computing feature importance over the Rashomon set through the **Rashomon Importance Distribution (RID)** and to directly use the proxy algorithms to return one tree, if desired.
 
