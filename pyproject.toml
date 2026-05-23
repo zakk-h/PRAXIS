@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tree-praxis"
-version = "0.0.14"
+version = "0.0.15"
 description = "Rashomon set tools via PRAXIS, including approximation, exact calculation, and variable importance utilities."
 readme = "README.md"
 requires-python = ">=3.9"
