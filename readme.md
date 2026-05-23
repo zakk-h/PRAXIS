@@ -18,7 +18,7 @@ misclassifications + lambda_reg * n_samples * number_of_leaves.
 
 This is useful when there are many decision trees with nearly the same accuracy. Rather than pretending there is one uniquely best tree, PRAXIS lets you inspect, count, compare, and make predictions with all good trees.
 
-See [`examples/example.ipynb`](examples/example.ipynb) for a complete walkthrough of using the code.
+See [`examples/example.ipynb`](https://github.com/zakk-h/PRAXIS/blob/praxis/examples/example.ipynb) for a complete walkthrough of using the code.
 
 To learn more about the algorithmic ideas behind PRAXIS, please see our ICML 2026 paper. At a high level, PRAXIS uses a proxy algorithm to estimate the best achievable objective within each subproblem, and then refines these estimates as enumeration proceeds. When the proxy algorithm is exact, PRAXIS performs exact Rashomon set enumeration. When the proxy is approximate, PRAXIS can trade a small amount of empirical approximation quality for substantially faster runtime.
 
@@ -73,7 +73,7 @@ print("Number of trees:", model.count_trees())
 print("Minimum objective:", model.get_min_objective())
 ```
 
-See [`examples/example.ipynb`](examples/example.ipynb) for a complete walkthrough on binarization, fitting PRAXIS, and accessing information about the Rashomon set. We provide a comprehensive list of options and included methods below.
+See [`examples/example.ipynb`](https://github.com/zakk-h/PRAXIS/blob/praxis/examples/example.ipynb) for a complete walkthrough on binarization, fitting PRAXIS, and accessing information about the Rashomon set. We provide a comprehensive list of options and included methods below.
 
 ## `PRAXIS.fit(...)`
 
@@ -456,4 +456,4 @@ model.fit(
 
 If your original data is not binary, use `ThresholdGuessBinarizer` before fitting.
 
-See [`examples/example.ipynb`](examples/example.ipynb) for a complete walkthrough on binarization, fitting PRAXIS, and accessing information about the Rashomon set.
+See [`examples/example.ipynb`](https://github.com/zakk-h/PRAXIS/blob/praxis/examples/example.ipynb) for a complete walkthrough on binarization, fitting PRAXIS, and accessing information about the Rashomon set.
