@@ -3,9 +3,10 @@ requires = ["setuptools>=64", "wheel", "pybind11>=2.13", "numpy>=1.23"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "praxis"
-version = "0.0.12"
-description = "Rashomon set tools via PRAXIS (includes approximation, exact calculation, and variable importance utilities)"
+name = "tree-praxis"
+version = "0.0.13"
+description = "Rashomon set tools via PRAXIS, including approximation, exact calculation, and variable importance utilities."
+readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [
@@ -21,6 +22,29 @@ dependencies = [
   "scikit-learn>=1.1",
   "pandas>=1.5"
 ]
+keywords = [
+  "interpretable machine learning",
+  "decision trees",
+  "rashomon set",
+  "optimization",
+  "variable importance"
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: C++",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
 
 [project.urls]
 Homepage = "https://github.com/zakk-h/LicketyRESPLIT"
+Repository = "https://github.com/zakk-h/LicketyRESPLIT"
+Issues = "https://github.com/zakk-h/LicketyRESPLIT/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
