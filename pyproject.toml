@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tree-praxis"
-version = "0.0.15"
+version = "0.0.16"
 description = "Rashomon set tools via PRAXIS, including approximation, exact calculation, and variable importance utilities."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -42,9 +42,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/zakk-h/LicketyRESPLIT"
-Repository = "https://github.com/zakk-h/LicketyRESPLIT"
-Issues = "https://github.com/zakk-h/LicketyRESPLIT/issues"
+Homepage = "https://github.com/zakk-h/PRAXIS"
+Repository = "https://github.com/zakk-h/PRAXIS"
+Issues = "https://github.com/zakk-h/PRAXIS/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
