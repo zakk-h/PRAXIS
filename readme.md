@@ -13,10 +13,12 @@ This code creates **Rashomon sets of decision trees**. The Rashomon set is the s
 PRAXIS is designed to enumerate the Rashomon set for **sparse decision trees**. In other words, instead of returning a single optimal decision tree, it returns a set of decision trees whose objective values are all within a small factor of the best tree found. The objective is:
 
 ```text
-misclassification loss + penalty on the number of leaves
+misclassifications + lambda_reg * n_samples * number_of_leaves.
 ```
 
 This is useful when there are many decision trees with nearly the same accuracy. Rather than pretending there is one uniquely best tree, PRAXIS lets you inspect, count, compare, and make predictions with all good trees.
+
+See [`examples/example.ipynb`](examples/example.ipynb) for a complete walkthrough of using the code.
 
 To learn more about the algorithmic ideas behind PRAXIS, please see our ICML 2026 paper. At a high level, PRAXIS uses a proxy algorithm to estimate the best achievable objective within each subproblem, and then refines these estimates as enumeration proceeds. When the proxy algorithm is exact, PRAXIS performs exact Rashomon set enumeration. When the proxy is approximate, PRAXIS can trade a small amount of empirical approximation quality for substantially faster runtime.
 
