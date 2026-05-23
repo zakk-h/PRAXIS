@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tree-praxis"
-version = "0.0.16"
+version = "0.0.17"
 description = "PRAXIS computes exact and approximate Rashomon sets of decision trees, individual high-quality trees, and variable importance over the full set of good models."
 requires-python = ">=3.9"
 license = {text = "MIT"}
