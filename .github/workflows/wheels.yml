@@ -7,16 +7,13 @@ on:
       - "praxis-v*"
 
 permissions:
-  contents: write
+  contents: read
   id-token: write
 
 jobs:
   build_wheels:
     name: Build wheels on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-
-    permissions:
-      contents: write
 
     strategy:
       fail-fast: false
@@ -55,19 +52,9 @@ jobs:
           name: wheels-${{ matrix.os }}
           path: wheelhouse/*.whl
 
-      - name: Upload wheels to GitHub Release
-        uses: softprops/action-gh-release@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          files: wheelhouse/*.whl
-
   build_sdist:
     name: Build sdist
     runs-on: ubuntu-22.04
-
-    permissions:
-      contents: write
 
     steps:
       - uses: actions/checkout@v4
@@ -87,13 +74,6 @@ jobs:
         with:
           name: sdist
           path: dist/*.tar.gz
-
-      - name: Upload sdist to GitHub Release
-        uses: softprops/action-gh-release@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          files: dist/*.tar.gz
 
   publish_pypi:
     name: Publish to PyPI
