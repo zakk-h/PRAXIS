@@ -179,6 +179,7 @@ class PRAXIS:
     def __init__(self):
         self._model = _PRAXISCore()
         self._rid_out = None
+        self._rid_feature_indices = None
 
     def fit(
         self,
@@ -559,6 +560,21 @@ class PRAXIS:
     def root_lickety_objective_lookahead1(self, depth_budget: int):
         return int(self._model.root_lickety_objective_lookahead1(int(depth_budget)))
 
+    def _canonicalize_binning_map(self, binning_map):
+        # returns binning map sorted by feature index
+    
+        if binning_map is None:
+            return None, None
+
+        feature_indices = sorted(int(k) for k in binning_map.keys())
+
+        canonical_map = {
+            j: sorted(int(c) for c in binning_map[j])
+            for j in feature_indices
+        }
+
+        return canonical_map, feature_indices
+
     def compute_rid(
         self,
         X,
@@ -575,6 +591,9 @@ class PRAXIS:
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=int)
 
+        binning_map, feature_indices = self._canonicalize_binning_map(binning_map)
+        self._rid_feature_indices = feature_indices
+
         self._rid_out = _rid_subtractive_core(
             X,
             y,
@@ -588,22 +607,50 @@ class PRAXIS:
             binning_map,
         )
         return self._rid_out
-    
+        
     def _require_rid(self):
         if self._rid_out is None:
             raise RuntimeError("RID not computed. Call compute_rid(...) first.")
         return self._rid_out
+
+    def _resolve_rid_feature_names(self, feature_names):
+        # allows either: feature_names=None, feature_names already matching RID feature order, full original feature_names, where we subset using self._rid_feature_indices
+
+        if feature_names is None:
+            return None
+
+        feature_names = list(feature_names)
+
+        if self._rid_feature_indices is None:
+            return feature_names
+
+        V = len(self._rid_feature_indices)
+
+        if len(feature_names) == V:
+            return feature_names
+
+        max_j = max(self._rid_feature_indices) if V > 0 else -1
+        if len(feature_names) > max_j:
+            return [feature_names[j] for j in self._rid_feature_indices]
+
+        raise ValueError(
+            f"feature_names has length {len(feature_names)}, but RID has {V} features "
+            f"with original indices {self._rid_feature_indices}."
+        )
     
     def rid_plot_mean(self, feature_names=None, **kwargs):
         rid_out = self._require_rid()
+        feature_names = self._resolve_rid_feature_names(feature_names)
         return rid_plot_mean(rid_out, feature_names=feature_names, **kwargs)
 
     def rid_plot_violin(self, feature_names=None, **kwargs):
         rid_out = self._require_rid()
+        feature_names = self._resolve_rid_feature_names(feature_names)
         return rid_plot_violin(rid_out, feature_names=feature_names, **kwargs)
 
     def rid_plot_cdfs(self, feature_names=None, **kwargs):
         rid_out = self._require_rid()
+        feature_names = self._resolve_rid_feature_names(feature_names)
         return rid_plot_cdfs(rid_out, feature_names=feature_names, **kwargs)
     
     @staticmethod
