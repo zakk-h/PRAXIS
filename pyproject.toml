@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tree-praxis"
-version = "0.0.19"
+version = "0.0.20"
 description = "PRAXIS computes exact and approximate Rashomon sets of decision trees, individual high-quality trees, and variable importance over the full set of good models."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -20,7 +20,9 @@ dependencies = [
   "numpy>=1.23",
   "matplotlib>=3.6",
   "scikit-learn>=1.1",
-  "pandas>=1.5"
+  "pandas>=1.5",
+  "ipywidgets>=8.0",
+  "ipython>=8.0"
 ]
 keywords = [
   "interpretable machine learning",
