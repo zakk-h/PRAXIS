@@ -392,6 +392,37 @@ struct TreeTrieNode {
 
 };
 
+struct ExportLeafNode {
+    int id = -1;
+    int parent_trie_id = -1;
+    int prediction = -1;
+};
+
+struct ExportSplitNode {
+    int id = -1;
+    int parent_trie_id = -1;
+    int feature = -1;
+    int left_trie_id = -1;
+    int right_trie_id = -1;
+};
+
+struct ExportTreeTrieNode {
+    int id = -1;
+
+    // terminal leaf alternatives directly available at this OR node
+    std::vector<int> leaf_ids;
+
+    // AND/split alternatives directly available at this OR node
+    std::vector<int> split_ids;
+};
+
+struct ExportANDORGraph {
+    int root_trie_id = -1;
+    std::vector<ExportTreeTrieNode> trie_nodes;
+    std::vector<ExportSplitNode> split_nodes;
+    std::vector<ExportLeafNode> leaf_nodes;
+};
+
 struct PredNode {
     int feature;  // -1 for leaf
     int prediction; // only meaningful if feature == -1
@@ -944,6 +975,122 @@ public:
 
         PathKey root_pk;
         return generalized_lickety_split(root, depth_budget, /*k=*/1, root_pk);
+    }
+
+    ExportANDORGraph export_andor_graph(
+        std::size_t max_trie_nodes = 2000000000000,
+        std::size_t max_split_nodes = 500000000000,
+        std::size_t max_leaf_nodes = 500000000000
+    ) const {
+        if (!result) {
+            throw std::runtime_error(
+                "No Rashomon trie has been constructed. Call fit(..., rashomon_mode=true) first."
+            );
+        }
+
+        ExportANDORGraph out;
+
+        std::unordered_map<const TreeTrieNode*, int> trie_id;
+        std::unordered_set<const TreeTrieNode*> processed;
+
+        auto get_trie_id = [&](const std::shared_ptr<TreeTrieNode>& p) -> int {
+            if (!p) return -1;
+
+            const TreeTrieNode* raw = p.get();
+            auto it = trie_id.find(raw);
+            if (it != trie_id.end()) return it->second;
+
+            if (out.trie_nodes.size() >= max_trie_nodes) {
+                throw std::runtime_error(
+                    "export_andor_graph exceeded max_trie_nodes. "
+                    "Increase the limit or fit a smaller Rashomon set."
+                );
+            }
+
+            int id = static_cast<int>(out.trie_nodes.size());
+            trie_id.emplace(raw, id);
+
+            ExportTreeTrieNode node;
+            node.id = id;
+            out.trie_nodes.push_back(std::move(node));
+
+            return id;
+        };
+
+        out.root_trie_id = get_trie_id(result);
+
+        std::vector<std::shared_ptr<TreeTrieNode>> stack;
+        stack.push_back(result);
+
+        while (!stack.empty()) {
+            std::shared_ptr<TreeTrieNode> cur_ptr = stack.back();
+            stack.pop_back();
+
+            if (!cur_ptr) continue;
+
+            const TreeTrieNode* cur = cur_ptr.get();
+            if (processed.find(cur) != processed.end()) continue;
+            processed.insert(cur);
+
+            const int cur_id = trie_id.at(cur);
+
+            // export leaf alternatives.
+            for (const LeafNode& leaf : cur->leaves) {
+                if (out.leaf_nodes.size() >= max_leaf_nodes) {
+                    throw std::runtime_error(
+                        "export_andor_graph exceeded max_leaf_nodes. "
+                        "Increase the limit or fit a smaller Rashomon set."
+                    );
+                }
+
+                ExportLeafNode e;
+                e.id = static_cast<int>(out.leaf_nodes.size());
+                e.parent_trie_id = cur_id;
+                e.prediction = leaf.prediction;
+
+                // access by index at the moment of mutation.
+                out.trie_nodes[cur_id].leaf_ids.push_back(e.id);
+
+                out.leaf_nodes.push_back(std::move(e));
+            }
+
+            // export split / AND alternatives.
+            for (const SplitNode& split : cur->splits) {
+                if (!split.left || !split.right) continue;
+
+                if (out.split_nodes.size() >= max_split_nodes) {
+                    throw std::runtime_error(
+                        "export_andor_graph exceeded max_split_nodes. "
+                        "Increase the limit or fit a smaller Rashomon set."
+                    );
+                }
+
+                // these calls can push into out.trie_nodes and reallocate it.
+                // we must not hold references into out.trie_nodes across these calls.
+                const int left_id = get_trie_id(split.left);
+                const int right_id = get_trie_id(split.right);
+
+                ExportSplitNode e;
+                e.id = static_cast<int>(out.split_nodes.size());
+                e.parent_trie_id = cur_id;
+                e.feature = split.feature;
+                e.left_trie_id = left_id;
+                e.right_trie_id = right_id;
+
+                out.trie_nodes[cur_id].split_ids.push_back(e.id);
+
+                out.split_nodes.push_back(std::move(e));
+
+                if (processed.find(split.left.get()) == processed.end()) {
+                    stack.push_back(split.left);
+                }
+                if (processed.find(split.right.get()) == processed.end()) {
+                    stack.push_back(split.right);
+                }
+            }
+        }
+
+        return out;
     }
 
 private:

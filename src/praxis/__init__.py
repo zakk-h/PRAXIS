@@ -5,6 +5,8 @@ from matplotlib.lines import Line2D
 from matplotlib.cm import get_cmap
 from ._core import PRAXIS as _PRAXISCore, rid_subtractive_model_reliance as _rid_subtractive_core
 from ._threshold_guessing import ThresholdGuessBinarizer
+import ipywidgets as widgets
+from IPython.display import display, clear_output
 
 __all__ = ["PRAXIS", "ThresholdGuessBinarizer"]
 
@@ -250,6 +252,65 @@ class PRAXIS:
 
     def get_root_histogram(self):
         return self._model.get_root_histogram()
+
+    def export_andor_graph(self, as_dict=True):
+        g = self._model.export_andor_graph()
+
+        if not as_dict:
+            return g
+
+        return {
+            "root_trie_id": int(g.root_trie_id),
+            "trie_nodes": [
+                {
+                    "id": int(node.id),
+                    "leaf_ids": [int(x) for x in node.leaf_ids],
+                    "split_ids": [int(x) for x in node.split_ids],
+                }
+                for node in g.trie_nodes
+            ],
+            "split_nodes": [
+                {
+                    "id": int(split.id),
+                    "parent_trie_id": int(split.parent_trie_id),
+                    "feature": int(split.feature),
+                    "left_trie_id": int(split.left_trie_id),
+                    "right_trie_id": int(split.right_trie_id),
+                }
+                for split in g.split_nodes
+            ],
+            "leaf_nodes": [
+                {
+                    "id": int(leaf.id),
+                    "parent_trie_id": int(leaf.parent_trie_id),
+                    "prediction": int(leaf.prediction),
+                }
+                for leaf in g.leaf_nodes
+            ],
+        }
+
+    def interactive_tree_builder(
+        self,
+        feature_names=None,
+        continuous_groups=None,
+        thresholds=None,
+        figsize=(9, 6),
+        auto_expand_single=True,
+        title="Interactive PRAXIS tree builder",
+    ):
+        graph = self.export_andor_graph(as_dict=True)
+
+        builder = _InteractiveANDORBuilder(
+            graph=graph,
+            feature_names=feature_names,
+            continuous_groups=continuous_groups,
+            thresholds=thresholds,
+            figsize=figsize,
+            auto_expand_single=auto_expand_single,
+            title=title,
+        )
+        builder.display()
+        return builder
     
     def get_tree_objective(self, tree_index: int):
         obj, obj_norm = self._model.get_tree_objective(int(tree_index))
@@ -550,6 +611,7 @@ class PRAXIS:
         if show:
             plt.show()
         return fig, ax
+
 
 
         
@@ -959,5 +1021,829 @@ def rid_plot_cdfs(
     return fig, ax
 
 
+class _BuildNode:
+    __slots__ = (
+        "uid",
+        "graph_trie_id",
+        "kind",
+        "feature",
+        "prediction",
+        "left",
+        "right",
+    )
 
+    def __init__(self, uid, graph_trie_id):
+        self.uid = int(uid)
+        self.graph_trie_id = int(graph_trie_id)
+        self.kind = "choice" # "choice", "split", or "leaf"
+        self.feature = None
+        self.prediction = None
+        self.left = None
+        self.right = None
 
+class _InteractiveANDORBuilder:
+    def __init__(
+        self,
+        graph,
+        feature_names=None,
+        continuous_groups=None,
+        thresholds=None,
+        figsize=(7.0, 5.6),
+        auto_expand_single=True,
+        title="Interactive PRAXIS tree builder",
+    ):
+        self.graph = graph
+        self.figsize = figsize
+        self.auto_expand_single = bool(auto_expand_single)
+        self.title = str(title)
+
+        self.trie_nodes = {int(n["id"]): n for n in graph["trie_nodes"]}
+        self.split_nodes = {int(s["id"]): s for s in graph["split_nodes"]}
+        self.leaf_nodes = {int(l["id"]): l for l in graph["leaf_nodes"]}
+
+        max_feature = -1
+        for s in graph["split_nodes"]:
+            max_feature = max(max_feature, int(s["feature"]))
+
+        if feature_names is None:
+            self.feature_names = [f"f{j}" for j in range(max_feature + 1)]
+        else:
+            self.feature_names = list(feature_names)
+
+        while len(self.feature_names) <= max_feature:
+            self.feature_names.append(f"f{len(self.feature_names)}")
+
+        self.feature_to_group = {}
+        self.group_to_features = {}
+
+        if continuous_groups is not None:
+            if isinstance(continuous_groups, dict):
+                for group_name, cols in continuous_groups.items():
+                    group_name = str(group_name)
+                    cols = [int(c) for c in cols]
+                    self.group_to_features[group_name] = cols
+                    for c in cols:
+                        self.feature_to_group[c] = group_name
+            else:
+                for gi, cols in enumerate(continuous_groups):
+                    group_name = f"group_{gi}"
+                    cols = [int(c) for c in cols]
+                    self.group_to_features[group_name] = cols
+                    for c in cols:
+                        self.feature_to_group[c] = group_name
+
+        self.feature_thresholds = {}
+        if thresholds is not None:
+            if isinstance(thresholds, dict):
+                iterator = thresholds.items()
+            else:
+                iterator = enumerate(thresholds)
+
+            for k, v in iterator:
+                if v is None:
+                    continue
+                self.feature_thresholds[int(k)] = v
+
+        self._next_uid = 0
+        self.root = self._new_choice_node(int(graph["root_trie_id"]))
+        self.active_node_uid = self.root.uid
+        self.node_by_uid = {self.root.uid: self.root}
+
+        self._suppress_dropdown_observer = False
+        self._current_click_cid = None
+        self._current_hitboxes = {}
+
+        canvas_px = int(self.figsize[0] * 100)
+        menu_px = 340
+        gap_px = 10
+        total_px = canvas_px + menu_px + gap_px
+
+        with plt.ioff():
+            self._current_fig, self._current_ax = plt.subplots(figsize=self.figsize)
+
+        self.canvas_container = widgets.VBox(
+            [self._current_fig.canvas],
+            layout=widgets.Layout(
+                width=f"{canvas_px}px",
+                min_width=f"{canvas_px}px",
+                max_width=f"{canvas_px}px",
+                overflow="hidden",
+            ),
+        )
+
+        self.menu_out = widgets.Output(
+            layout=widgets.Layout(
+                width=f"{menu_px}px",
+                min_width=f"{menu_px}px",
+                max_width=f"{menu_px}px",
+                overflow="hidden",
+            )
+        )
+
+        self.status = widgets.HTML()
+
+        self.active_dropdown = widgets.Dropdown(
+            options=[],
+            description="Node:",
+            layout=widgets.Layout(width="250px"),
+        )
+        self.active_dropdown.observe(self._on_dropdown_change, names="value")
+
+        self.reset_button = widgets.Button(
+            description="Reset",
+            button_style="warning",
+            layout=widgets.Layout(width="86px", height="34px"),
+        )
+        self.reset_button.on_click(lambda _: self.reset())
+
+        self.container = widgets.VBox(
+            [
+                widgets.HBox(
+                    [self.active_dropdown, self.reset_button, self.status],
+                    layout=widgets.Layout(align_items="center", gap="8px"),
+                ),
+                widgets.HBox(
+                    [self.canvas_container, self.menu_out],
+                    layout=widgets.Layout(
+                        align_items="flex-start",
+                        gap=f"{gap_px}px",
+                        width=f"{total_px}px",
+                        overflow="visible",
+                    ),
+                ),
+            ],
+            layout=widgets.Layout(width=f"{total_px}px", overflow="visible"),
+        )
+
+        self._auto_expand_all_singletons()
+
+        if self._current_click_cid is not None:
+            try:
+                self._current_fig.canvas.mpl_disconnect(self._current_click_cid)
+            except Exception:
+                pass
+
+        self._current_click_cid = self._current_fig.canvas.mpl_connect(
+            "button_press_event",
+            self._on_canvas_click,
+        )
+
+        self._refresh()
+
+    def _on_canvas_click(self, event):
+        if event.inaxes is not self._current_ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        best_uid = None
+        best_kind = None
+        best_dist = float("inf")
+
+        for uid, (x, y, r, kind) in self._current_hitboxes.items():
+            dx = float(event.xdata) - x
+            dy = float(event.ydata) - y
+            dist = (dx * dx + dy * dy) ** 0.5
+
+            if dist <= 1.2 * r and dist < best_dist:
+                best_uid = uid
+                best_kind = kind
+                best_dist = dist
+
+        if best_uid is None:
+            return
+
+        if best_kind == "choice":
+            self._select_node(best_uid)
+        else:
+            self._rewind_to_node(best_uid)
+
+    def _new_choice_node(self, graph_trie_id):
+        node = _BuildNode(self._next_uid, graph_trie_id)
+        self._next_uid += 1
+        return node
+
+    def display(self):
+        display(self.container)
+
+    def reset(self):
+        self._next_uid = 0
+        self.root = self._new_choice_node(int(self.graph["root_trie_id"]))
+        self.node_by_uid = {self.root.uid: self.root}
+        self.active_node_uid = self.root.uid
+        self._auto_expand_all_singletons()
+        self._refresh()
+
+    def _feature_label(self, f):
+        f = int(f)
+        if 0 <= f < len(self.feature_names):
+            return str(self.feature_names[f])
+        return f"f{f}"
+
+    def _format_threshold_value(self, value):
+        return str(value)
+
+    def _continuous_threshold_label(self, f):
+        f = int(f)
+
+        if f in self.feature_thresholds:
+            return self._format_threshold_value(self.feature_thresholds[f])
+
+        name = self._feature_label(f)
+
+        for op in ["<=", ">=", "<", ">", "="]:
+            if op in name:
+                raw = name.split(op, 1)[1].strip()
+                try:
+                    return f"{float(raw):.3f}"
+                except Exception:
+                    return raw
+
+        return name
+
+    def _split_label(self, split):
+        f = int(split["feature"])
+        return self._feature_label(f)
+
+    def _choices_for_graph_trie(self, graph_trie_id):
+        t = self.trie_nodes[int(graph_trie_id)]
+        choices = []
+
+        for leaf_id in t["leaf_ids"]:
+            leaf = self.leaf_nodes[int(leaf_id)]
+            choices.append(("leaf", leaf))
+
+        for split_id in t["split_ids"]:
+            split = self.split_nodes[int(split_id)]
+            choices.append(("split", split))
+
+        return choices
+
+    def _choice_count(self, node):
+        if node.kind != "choice":
+            return 0
+        return len(self._choices_for_graph_trie(node.graph_trie_id))
+
+    def _auto_expand_node_if_singleton(self, node):
+        changed = False
+
+        while node.kind == "choice":
+            choices = self._choices_for_graph_trie(node.graph_trie_id)
+            if len(choices) != 1:
+                break
+
+            typ, obj = choices[0]
+            if typ == "leaf":
+                self._apply_leaf(node, obj, refresh=False)
+                changed = True
+                break
+
+            if typ == "split":
+                self._apply_split(node, obj, refresh=False)
+                changed = True
+                self._auto_expand_node_if_singleton(node.left)
+                self._auto_expand_node_if_singleton(node.right)
+                break
+
+        return changed
+
+    def _walk_build_nodes(self):
+        out = []
+
+        def dfs(node):
+            if node is None:
+                return
+            out.append(node)
+            dfs(node.left)
+            dfs(node.right)
+
+        dfs(self.root)
+        return out
+
+    def _collect_descendant_uids(self, node):
+        out = []
+
+        def dfs(x):
+            if x is None:
+                return
+            out.append(x.uid)
+            dfs(x.left)
+            dfs(x.right)
+
+        dfs(node.left)
+        dfs(node.right)
+        return out
+
+    def _rewind_to_node(self, uid):
+        uid = int(uid)
+        node = self.node_by_uid.get(uid)
+        if node is None:
+            return
+
+        if node.kind == "choice":
+            self._select_node(uid)
+            return
+
+        for child_uid in self._collect_descendant_uids(node):
+            self.node_by_uid.pop(child_uid, None)
+
+        node.kind = "choice"
+        node.feature = None
+        node.prediction = None
+        node.left = None
+        node.right = None
+
+        self.active_node_uid = node.uid
+        self._refresh()
+
+    def _auto_expand_all_singletons(self):
+        changed = True
+        while changed:
+            changed = False
+            for node in list(self._walk_build_nodes()):
+                if node.kind == "choice":
+                    if self._auto_expand_node_if_singleton(node):
+                        changed = True
+
+    def _apply_leaf(self, node, leaf, refresh=True):
+        node.kind = "leaf"
+        node.prediction = int(leaf["prediction"])
+        node.feature = None
+        node.left = None
+        node.right = None
+        if refresh:
+            self._auto_expand_all_singletons()
+            self._refresh()
+
+    def _apply_split(self, node, split, refresh=True):
+        node.kind = "split"
+        node.feature = int(split["feature"])
+        node.prediction = None
+
+        left = self._new_choice_node(int(split["left_trie_id"]))
+        right = self._new_choice_node(int(split["right_trie_id"]))
+
+        node.left = left
+        node.right = right
+
+        self.node_by_uid[left.uid] = left
+        self.node_by_uid[right.uid] = right
+
+        if refresh:
+            self.active_node_uid = left.uid
+            self._auto_expand_all_singletons()
+            self._refresh()
+
+    def _select_node(self, uid):
+        uid = int(uid)
+        node = self.node_by_uid.get(uid)
+
+        if node is None or node.kind != "choice":
+            return
+
+        self.active_node_uid = uid
+
+        try:
+            self._suppress_dropdown_observer = True
+            if self.active_dropdown.value != uid:
+                self.active_dropdown.value = uid
+        finally:
+            self._suppress_dropdown_observer = False
+
+        self._draw_tree()
+        self._refresh_menu_only()
+
+    def _on_dropdown_change(self, change):
+        if self._suppress_dropdown_observer:
+            return
+
+        if change["new"] is None:
+            return
+
+        uid = int(change["new"])
+        node = self.node_by_uid.get(uid)
+
+        if node is None or node.kind != "choice":
+            return
+
+        self.active_node_uid = uid
+        self._draw_tree()
+        self._refresh_menu_only()
+
+    def _frontier_nodes(self):
+        return [n for n in self._walk_build_nodes() if n.kind == "choice"]
+
+    def _refresh(self):
+        self._refresh_dropdown()
+        self._draw_tree()
+        self._refresh_menu_only()
+
+    def _refresh_dropdown(self):
+        frontier = self._frontier_nodes()
+        options = [
+            (f"node {n.uid} ({self._choice_count(n)} choices)", n.uid)
+            for n in frontier
+        ]
+
+        try:
+            self._suppress_dropdown_observer = True
+
+            if not options:
+                self.active_dropdown.options = []
+                self.active_dropdown.value = None
+                return
+
+            frontier_ids = {uid for _, uid in options}
+            if self.active_node_uid not in frontier_ids:
+                self.active_node_uid = options[0][1]
+
+            self.active_dropdown.options = options
+            self.active_dropdown.value = self.active_node_uid
+
+        finally:
+            self._suppress_dropdown_observer = False
+
+    def _refresh_menu_only(self):
+        active = self.node_by_uid.get(self.active_node_uid)
+
+        if active is None or active.kind != "choice":
+            menu_widget = widgets.HTML("<b>No unresolved node selected.</b>")
+            with self.menu_out:
+                clear_output(wait=True)
+                display(menu_widget)
+            return
+
+        choices = self._choices_for_graph_trie(active.graph_trie_id)
+
+        html = widgets.HTML(
+            f"""
+            <div style="font-family: sans-serif; width: 305px; line-height: 1.25;">
+              <h3 style="margin: 0 0 6px 0;">Node {active.uid}</h3>
+              <div style="color: #555; margin-bottom: 8px; font-size: 14px;">
+                {len(choices)} available choices
+              </div>
+              <div style="color: #777; font-size: 11px; margin-bottom: 10px;">
+                Click an unresolved node to select it. Click a resolved split/leaf to undo below it.
+              </div>
+            </div>
+            """
+        )
+
+        leaf_buttons = []
+        grouped_splits = {}
+        binary_splits = []
+        button_style = {"font_size": "13px", "button_color": "#f5f5f5"}
+
+        for typ, obj in choices:
+            if typ == "leaf":
+                b = widgets.Button(
+                    description=f"Leaf: predict {int(obj['prediction'])}",
+                    button_style="success",
+                    layout=widgets.Layout(width="300px", height="32px"),
+                    style={"font_size": "13px"},
+                )
+                b.on_click(lambda _, leaf=obj, node=active: self._apply_leaf(node, leaf))
+                leaf_buttons.append(b)
+            else:
+                f = int(obj["feature"])
+                group = self.feature_to_group.get(f)
+                if group is None:
+                    binary_splits.append(obj)
+                else:
+                    grouped_splits.setdefault(group, []).append(obj)
+
+        sections = [html]
+
+        if leaf_buttons:
+            sections.append(widgets.HTML("<div style='font-weight:700;margin:4px 0 6px 0;'>Leaf options</div>"))
+            sections.extend(leaf_buttons)
+
+        if grouped_splits:
+            # sections.append(widgets.HTML("<div style='font-weight:700;margin:12px 0 6px 0;'>Continuous-feature split options</div>"))
+
+            for group_name, splits in grouped_splits.items():
+                sections.append(
+                    widgets.HTML(
+                        f"""
+                        <div style="
+                            margin: 10px 0 6px 0;
+                            font-weight: 700;
+                            color: #222;
+                            font-size: 15px;
+                        ">
+                            {group_name}
+                        </div>
+                        """
+                    )
+                )
+
+                def _continuous_sort_key(s):
+                    f = int(s["feature"])
+                    if f in self.feature_thresholds:
+                        v = self.feature_thresholds[f]
+                        try:
+                            return (0, float(v))
+                        except Exception:
+                            return (1, str(v))
+
+                    label = self._continuous_threshold_label(f)
+                    try:
+                        return (2, float(label))
+                    except Exception:
+                        return (3, label)
+
+                buttons = []
+                for split in sorted(splits, key=_continuous_sort_key):
+                    f = int(split["feature"])
+                    button_label = self._continuous_threshold_label(f)
+
+                    b = widgets.Button(
+                        description=button_label,
+                        tooltip=f"{group_name}: {self._feature_label(f)} [feature {f}]",
+                        layout=widgets.Layout(width="92px", height="30px"),
+                        style=button_style,
+                    )
+                    b.on_click(lambda _, sp=split, node=active: self._apply_split(node, sp))
+                    buttons.append(b)
+
+                grid = widgets.GridBox(
+                    buttons,
+                    layout=widgets.Layout(
+                        width="300px",
+                        grid_template_columns="repeat(3, 92px)",
+                        grid_auto_rows="30px",
+                        grid_column_gap="6px",
+                        grid_row_gap="5px",
+                        margin="0 0 4px 0",
+                    ),
+                )
+                sections.append(grid)
+
+        if binary_splits:
+            sections.append(widgets.HTML("<div style='font-weight:700;margin:12px 0 6px 0;'>Binary split options</div>"))
+
+            buttons = []
+            for split in sorted(binary_splits, key=lambda s: self._feature_label(int(s["feature"]))):
+                f = int(split["feature"])
+                b = widgets.Button(
+                    description=self._feature_label(f),
+                    tooltip=f"Split on binary feature index {f}",
+                    layout=widgets.Layout(width="300px", height="32px"),
+                    style=button_style,
+                )
+                b.on_click(lambda _, sp=split, node=active: self._apply_split(node, sp))
+                buttons.append(b)
+
+            sections.extend(buttons)
+
+        menu_widget = widgets.VBox(
+            sections,
+            layout=widgets.Layout(
+                width="320px",
+                min_width="320px",
+                max_width="320px",
+                max_height="680px",
+                overflow_y="auto",
+                overflow_x="hidden",
+                border="1px solid #ddd",
+                padding="10px",
+                box_sizing="border-box",
+            ),
+        )
+
+        with self.menu_out:
+            clear_output(wait=True)
+            display(menu_widget)
+
+    def _draw_tree(self):
+        fig = self._current_fig
+        ax = self._current_ax
+
+        ax.clear()
+        ax.set_axis_off()
+
+        def is_layout_leaf(node):
+            return (
+                node is None
+                or node.kind == "leaf"
+                or (node.kind == "choice" and node.left is None and node.right is None)
+                or (node.left is None and node.right is None)
+            )
+
+        leaves_for_layout = []
+
+        def collect_layout_leaves(node):
+            if node is None:
+                return
+            if is_layout_leaf(node):
+                leaves_for_layout.append(node)
+                return
+            collect_layout_leaves(node.left)
+            collect_layout_leaves(node.right)
+
+        collect_layout_leaves(self.root)
+        if not leaves_for_layout:
+            leaves_for_layout = [self.root]
+
+        leaf_x = {leaf: i for i, leaf in enumerate(leaves_for_layout)}
+        n_leaves = len(leaves_for_layout)
+
+        positions_raw = {} # uid -> (x_float, depth_int)
+
+        def assign(node, depth):
+            if node is None:
+                return
+            if is_layout_leaf(node):
+                positions_raw[node.uid] = (float(leaf_x[node]), float(depth))
+                return
+            assign(node.left, depth + 1)
+            assign(node.right, depth + 1)
+            lx, _ = positions_raw[node.left.uid]
+            rx, _ = positions_raw[node.right.uid]
+            positions_raw[node.uid] = (0.5 * (lx + rx), float(depth))
+
+        assign(self.root, 0)
+
+        fig_w, fig_h = self.figsize  # inches
+
+        pad_left   = 0.30
+        pad_right  = 0.30
+        pad_top    = 0.50
+        pad_bottom = 0.30
+
+        raw_depths = [d for _, d in positions_raw.values()]
+        max_depth  = max(raw_depths) if raw_depths else 0.0
+
+        usable_w = fig_w - pad_left - pad_right
+        if n_leaves > 1:
+            x_scale = usable_w / (n_leaves - 1)
+        else:
+            x_scale = usable_w  # single node, centered
+
+        usable_h = fig_h - pad_top - pad_bottom
+        if max_depth > 0:
+            y_scale = usable_h / max_depth
+        else:
+            y_scale = usable_h
+
+        positions = {} # uid -> (x_data, y_data)
+        for uid, (rx, rd) in positions_raw.items():
+            if n_leaves > 1:
+                x_data = pad_left + rx * x_scale
+            else:
+                x_data = fig_w / 2.0
+            y_data = fig_h - pad_top - rd * y_scale
+            positions[uid] = (x_data, y_data)
+
+        ax.set_xlim(0.0, fig_w)
+        ax.set_ylim(0.0, fig_h)
+        ax.set_aspect("equal", adjustable="box")
+        fig.subplots_adjust(left=0.0, right=1.0, top=1.0, bottom=0.0)
+
+        dpi = fig.dpi
+
+        internal_r = 0.06
+        choice_r   = 0.07
+        leaf_r     = 0.07
+
+        def r_to_s(r):
+            r_pts = r * dpi
+            return 3.1416 * r_pts * r_pts
+
+        internal_s = r_to_s(internal_r)
+        choice_s   = r_to_s(choice_r)
+        leaf_s     = r_to_s(leaf_r)
+
+        all_preds = [int(l["prediction"]) for l in self.graph["leaf_nodes"]]
+        num_classes = max(all_preds) + 1 if all_preds else 2
+        cmap = plt.colormaps.get_cmap("coolwarm")
+
+        def pred_color(pred):
+            if num_classes <= 1:
+                return cmap(0.5)
+            return cmap(float(pred) / float(num_classes - 1))
+
+        self._current_hitboxes = {}
+
+        def add_node_marker(node, x, y, s, facecolor, edgecolor, linewidth, radius_data):
+            ax.scatter(
+                [x], [y], s=s, marker="o",
+                facecolors=[facecolor], edgecolors=[edgecolor],
+                linewidths=linewidth, zorder=3, clip_on=False,
+            )
+            self._current_hitboxes[int(node.uid)] = (x, y, radius_data, str(node.kind))
+
+        def shrink_segment(x1, y1, x2, y2, r1, r2):
+            dx, dy = x2 - x1, y2 - y1
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist == 0:
+                return x1, y1, x2, y2
+            ux, uy = dx / dist, dy / dist
+            return (
+                x1 + ux * r1, y1 + uy * r1,
+                x2 - ux * r2, y2 - uy * r2,
+            )
+
+        def draw(node):
+            x, y = positions[node.uid]
+
+            if node.kind == "split":
+                for child, is_left in [(node.left, True), (node.right, False)]:
+                    if child is None:
+                        continue
+
+                    x2, y2 = positions[child.uid]
+                    child_r = (
+                        choice_r if child.kind == "choice"
+                        else leaf_r if child.kind == "leaf"
+                        else internal_r
+                    )
+
+                    sx, sy, ex, ey = shrink_segment(x, y, x2, y2, internal_r, child_r)
+
+                    ax.add_line(Line2D(
+                        [sx, ex], [sy, ey],
+                        color="#4D4D4D", linewidth=2.2, zorder=1, clip_on=False,
+                    ))
+
+                    mx = 0.25 * sx + 0.75 * ex
+                    my = 0.25 * sy + 0.75 * ey
+                    ax.text(
+                        mx, my, "T" if is_left else "F",
+                        ha="center", va="center", fontsize=9, color="#333",
+                        bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.9),
+                        zorder=5, clip_on=False,
+                    )
+
+                    draw(child)
+
+                add_node_marker(
+                    node=node, x=x, y=y, s=internal_s,
+                    facecolor="#DCEAF4", edgecolor="#4D4D4D", linewidth=1.6,
+                    radius_data=internal_r,
+                )
+                ax.text(
+                    x, y + internal_r + 0.04,
+                    self._feature_label(node.feature),
+                    ha="center", va="bottom", fontsize=10, color="#222222",
+                    bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.95),
+                    zorder=10, clip_on=False,
+                )
+
+            elif node.kind == "leaf":
+                add_node_marker(
+                    node=node, x=x, y=y, s=leaf_s,
+                    facecolor=pred_color(int(node.prediction)),
+                    edgecolor="#4D4D4D", linewidth=1.6,
+                    radius_data=leaf_r,
+                )
+                ax.text(
+                    x, y, str(int(node.prediction)),
+                    ha="center", va="center", fontsize=12, fontweight="bold",
+                    color="white", zorder=10, clip_on=False,
+                )
+
+            else: # choice
+                n_choices = self._choice_count(node)
+                is_active = node.uid == self.active_node_uid
+
+                is_only_node = node.uid == self.root.uid and len(self._walk_build_nodes()) == 1
+                node_s = choice_s * 4.0 if is_only_node else choice_s
+                node_r = choice_r * 2.0 if is_only_node else choice_r
+
+                add_node_marker(
+                    node=node, x=x, y=y, s=node_s,
+                    facecolor="#D7E8FF" if is_active else "#F2F2F2",
+                    edgecolor="#1C7ED6" if is_active else "#4D4D4D",
+                    linewidth=2.4 if is_active else 1.6,
+                    radius_data=node_r,
+                )
+
+                
+                ax.text(
+                    x, y, str(n_choices),
+                    ha="center", va="center", fontsize=12, fontweight="bold",
+                    color="#111", zorder=10, clip_on=False,
+                )
+                # ax.text(
+                #     x, y - choice_r - 0.04,
+                #     f"node {node.uid}",
+                #     ha="center", va="top", fontsize=8, color="#444",
+                #     zorder=10, clip_on=False,
+                # )
+
+        draw(self.root)
+
+        fig.text(
+            0.5, 0.97, self.title,
+            ha="center", va="top", fontsize=12, color="#111",
+            transform=fig.transFigure,
+        )
+
+        frontier = self._frontier_nodes()
+        if frontier:
+            self.status.value = f"<b>{len(frontier)}</b> unresolved node(s)"
+        else:
+            self.status.value = "<b>Tree complete.</b>"
+
+        fig.canvas.draw_idle()
