@@ -27,7 +27,7 @@ The **Rashomon set** is the set of all trees whose objective is within a multipl
 L(T) <= (1 + rashomon_mult) * L(T_reference)
 ```
 
-To learn more about the algorithmic ideas behind PRAXIS, please see our ICML 2026 paper. At a high level, PRAXIS uses a proxy algorithm to estimate the best achievable objective within each subproblem and uses it to set L(T_reference), and then refines these estimates as enumeration proceeds. When the proxy algorithm is exact, PRAXIS performs exact Rashomon set enumeration, finding all trees with L(T) <= (1 + rashomon_mult) * L(T_opt), where T_opt is a tree that minimizes the objective. When the proxy is approximate, PRAXIS can trade a small amount of empirical approximation quality for substantially faster runtime.
+To learn more about the algorithmic ideas behind PRAXIS, please see our [ICML 2026 paper](https://arxiv.org/abs/2606.00202). At a high level, PRAXIS uses a proxy algorithm to estimate the best achievable objective within each subproblem and uses it to set L(T_reference), and then refines these estimates as enumeration proceeds. When the proxy algorithm is exact, PRAXIS performs exact Rashomon set enumeration, finding all trees with L(T) <= (1 + rashomon_mult) * L(T_opt), where T_opt is a tree that minimizes the objective. When the proxy is approximate, PRAXIS can trade a small amount of empirical approximation quality for substantially faster runtime.
 
 
 
