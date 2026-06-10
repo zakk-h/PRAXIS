@@ -256,13 +256,13 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         make_bootstrap_dataset(X_row_major, y, idx, Xb, yb);
 
         const int n = (int)Xb.size();
-        const int n_words = (n + 63) / 64;
-        const uint64_t tail_mask = (n % 64) ? ((1ULL << (n % 64)) - 1ULL) : ~0ULL;
-        int y_max = 0;
-        for (int i = 0; i < (int)yb.size(); ++i) y_max = std::max(y_max, yb[i]);
-        const int n_classes = y_max + 1;
+        // const int n_words = (n + 63) / 64;
+        // const uint64_t tail_mask = (n % 64) ? ((1ULL << (n % 64)) - 1ULL) : ~0ULL;
+        // int y_max = 0;
+        // for (int i = 0; i < (int)yb.size(); ++i) y_max = std::max(y_max, yb[i]);
+        // const int n_classes = y_max + 1;
 
-        const auto y_bits = build_yc_packed(yb, n_classes, n_words, tail_mask);
+        // const auto y_bits = build_yc_packed(yb, n_classes, n_words, tail_mask);
 
         // row-major -> col-major bool for training
         std::vector<std::vector<bool>> Xcol;
@@ -291,20 +291,22 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         // reuse buffer for column/block scrambling
         std::vector<std::vector<uint8_t>> saved_cols;
 
-        const int budget_override = (int)llround((1.0 + rashomon_mult) * (double)model.result->min_objective);
-        auto orig = model.get_all_predictions_packed_trie(Xb, budget_override);
-        const uint64_t Tvec = (uint64_t)orig.size();
+        const int budget_override = (int)llround(
+            (1.0 + rashomon_mult) * (double)model.result->min_objective
+        );
+
+        auto orig_mis = model.get_all_misclassifications_packed_trie(
+            Xb,
+            yb,
+            budget_override
+        );
+
+        const uint64_t Tvec = (uint64_t)orig_mis.size();
 
         if (Tvec == 0) continue;
-        
+
         // weight per tree per bootstrap
-        const double wt_tree = 1.0 / ((double)n_bootstraps * (double)Tvec); // we may return more trees than we use (within new budget), so Tvec here
-
-
-        std::vector<int> correct_orig((size_t)Tvec, 0);
-        for (uint64_t t = 0; t < Tvec; ++t) {
-            correct_orig[(size_t)t] = count_correct_packed_multi(orig[(size_t)t].pred, y_bits, n_words, tail_mask);
-        }
+        const double wt_tree = 1.0 / ((double)n_bootstraps * (double)Tvec);
     
         // Consider this optimization: convert the bootstrap to column major once, and scramble the columns in column major (which is probably slightly slower), and then replace get_all_predictions_packed_trie to take in column major instead of taking in row and converting to column.
         // I think precomputing column major once instead of f times is better, even if it is not ideal for the scrambling.
@@ -313,12 +315,20 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
             const std::vector<int>& cols = var_cols[(size_t)v];
             scramble_block_inplace(Xb, cols, perms[(size_t)v], saved_cols);
 
-            auto scr = model.get_all_predictions_packed_trie(Xb, budget_override);
+            auto scr_mis = model.get_all_misclassifications_packed_trie(
+                Xb,
+                yb,
+                budget_override
+            );
+
             const uint64_t Tuse = Tvec;
 
             for (uint64_t t = 0; t < Tuse; ++t) {
-                const int correct_scr = count_correct_packed_multi(scr[(size_t)t].pred, y_bits, n_words, tail_mask);
-                const int delta_correct = correct_orig[(size_t)t] - correct_scr;
+                // correct_orig - correct_scr
+                // = (n - orig_mis) - (n - scr_mis)
+                // = scr_mis - orig_mis
+                const int delta_correct =
+                    scr_mis[(size_t)t] - orig_mis[(size_t)t];
 
                 out.mean_sub_mr[v] += wt_tree * ((double)delta_correct / (double)n);
                 mass_by_delta[v][delta_correct] += wt_tree;

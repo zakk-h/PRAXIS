@@ -2813,13 +2813,34 @@ private:
 
             // for filtering by <= budget, both Lb and Rb are sorted by obj.
             // we'll two-pointer for each left obj to find all right objs <= (budget - l_obj).
-            size_t r_hi = 0; // exclusive upper bound index in Rb
-            for (size_t li = 0; li < Lb.size(); ++li) {
-                const int lo = Lb[li].obj; // smallest objective initially
-                if (lo > budget) break;
-                const int rem = budget - lo; // how far do we have to look
+            // size_t r_hi = 0; // exclusive upper bound index in Rb
+            // for (size_t li = 0; li < Lb.size(); ++li) {
+            //     const int lo = Lb[li].obj; // smallest objective initially
+            //     if (lo > budget) break;
+            //     const int rem = budget - lo; // how far do we have to look
 
-                while (r_hi < Rb.size() && Rb[r_hi].obj <= rem) ++r_hi; // getting the first invalid index. never look past the remainder because RHS is also sorted
+            //     //while (r_hi < Rb.size() && Rb[r_hi].obj <= rem) ++r_hi; // getting the first invalid index. never look past the remainder because RHS is also sorted
+            //     // we could either go over Lb in reverse order or just do this 
+            //     auto it_end = std::upper_bound(R_objs.begin(), R_objs.end(), rem);
+            //     size_t r_hi = static_cast<size_t>(std::distance(R_objs.begin(), it_end));
+
+            std::vector<int> R_objs;
+            R_objs.reserve(Rb.size());
+            for (const auto& rb : Rb) {
+                R_objs.push_back(rb.obj); // don't need predictions here
+            }
+
+            for (size_t li = 0; li < Lb.size(); ++li) {
+                const int lo = Lb[li].obj;
+                if (lo > budget) break;
+
+                const int rem = budget - lo;
+
+                auto it_end = std::upper_bound(R_objs.begin(), R_objs.end(), rem);
+                const size_t r_hi = static_cast<size_t>(
+                    std::distance(R_objs.begin(), it_end)
+                );
+                            
                 if (r_hi == 0) continue; // no right objs fit
 
                 // cross product (filtered)
@@ -2855,6 +2876,216 @@ private:
         return to_sorted_buckets_multi_(acc);
     }
 
+    struct ObjMistakeBucket {
+        int obj;
+        std::vector<int> mistakes; // one entry per tree at this objective
+    };
+
+    struct MistakesWithObj {
+        int obj;
+        int mistakes;
+    };
+
+    static inline std::vector<ObjMistakeBucket> to_sorted_mistake_buckets_(
+        std::unordered_map<int, std::vector<int>>& acc
+    ) {
+        std::vector<ObjMistakeBucket> out;
+        out.reserve(acc.size());
+
+        for (auto& kv : acc) {
+            ObjMistakeBucket b;
+            b.obj = kv.first;
+            b.mistakes = std::move(kv.second);
+            out.push_back(std::move(b));
+        }
+
+        std::sort(out.begin(), out.end(),
+            [](const ObjMistakeBucket& a, const ObjMistakeBucket& b) {
+                return a.obj < b.obj;
+            });
+
+        return out;
+    }
+
+    static inline std::vector<Packed> build_eval_y_bits_(
+        const std::vector<int>& y_eval,
+        int num_classes,
+        int n_words,
+        uint64_t tail_mask
+    ) {
+        std::vector<Packed> Y_eval((size_t)num_classes, Packed((size_t)n_words));
+
+        for (int c = 0; c < num_classes; ++c) {
+            clear_eval(Y_eval[(size_t)c]);
+        }
+
+        for (int i = 0; i < (int)y_eval.size(); ++i) {
+            const int yi = y_eval[(size_t)i];
+            if (yi < 0 || yi >= num_classes) {
+                throw std::runtime_error("Eval y contains a class not seen during training.");
+            }
+            Y_eval[(size_t)yi].w[(size_t)(i >> 6)] |= (1ULL << (i & 63));
+        }
+
+        if (n_words > 0) {
+            for (int c = 0; c < num_classes; ++c) {
+                Y_eval[(size_t)c].w[(size_t)(n_words - 1)] &= tail_mask;
+            }
+        }
+
+        return Y_eval;
+    }
+
+    static inline int count_eval_mask_(const Packed& mask, int n_words) {
+        int s = 0;
+        for (int i = 0; i < n_words; ++i) {
+            s += popcnt64(mask.w[(size_t)i]);
+        }
+        return s;
+    }
+
+    static inline int popcount_and_eval_(
+        const Packed& a,
+        const Packed& b,
+        int n_words
+    ) {
+        int s = 0;
+        for (int i = 0; i < n_words; ++i) {
+            s += popcnt64(a.w[(size_t)i] & b.w[(size_t)i]);
+        }
+        return s;
+    }
+
+    std::vector<ObjMistakeBucket> collect_mistakes_by_obj_(
+        const TreeTrieNode* node,
+        int budget,
+        const Packed& eval_mask,
+        const EvalCtx& ctx,
+        const std::vector<Packed>& Y_eval_bits
+    ) const {
+        if (!node) return {};
+        if (budget < 0) return {};
+
+        constexpr int INF = std::numeric_limits<int>::max();
+
+        if (node->min_objective == INF) return {};
+        if (node->min_objective > budget) return {};
+
+        // training objective maps to list of eval misclassification counts,
+        // one scalar per tree
+        std::unordered_map<int, std::vector<int>> acc;
+
+        const int max_objs = budget - node->min_objective + 1;
+        acc.reserve((size_t)std::max(1, max_objs));
+
+        // leaf alternatives
+        for (const auto& leaf : node->leaves) {
+            if (leaf.loss > budget) continue;
+
+            const int pred_class = leaf.prediction;
+            if (pred_class < 0 || pred_class >= num_classes) {
+                throw std::runtime_error("Leaf prediction is outside valid class range.");
+            }
+
+            int mistakes = 0;
+
+            if (ctx.n_words > 0) {
+                const int n_here = count_eval_mask_(eval_mask, ctx.n_words);
+                const int correct = popcount_and_eval_(
+                    eval_mask,
+                    Y_eval_bits[(size_t)pred_class],
+                    ctx.n_words
+                );
+                mistakes = n_here - correct;
+            }
+
+            acc[leaf.loss].push_back(mistakes);
+        }
+
+        // split alternatives
+        for (const auto& split : node->splits) {
+            const TreeTrieNode* L = split.left.get();
+            const TreeTrieNode* R = split.right.get();
+            if (!L || !R) continue;
+
+            const int minL = L->min_objective;
+            const int minR = R->min_objective;
+
+            if (minL == INF || minR == INF) continue;
+
+            int bL = budget - minR;
+            int bR = budget - minL;
+
+            if (bL < 0 || bR < 0) continue;
+
+            // safety
+            bL = std::min(bL, L->budget);
+            bR = std::min(bR, R->budget);
+
+            Packed Lmask((size_t)ctx.n_words);
+            Packed Rmask((size_t)ctx.n_words);
+
+            if (ctx.n_words > 0) {
+                and_bits_eval(
+                    eval_mask,
+                    ctx.X_bits_eval[(size_t)split.feature],
+                    Lmask,
+                    ctx.n_words,
+                    ctx.tail_mask
+                );
+
+                andnot_bits_eval(
+                    eval_mask,
+                    ctx.X_bits_eval[(size_t)split.feature],
+                    Rmask,
+                    ctx.n_words,
+                    ctx.tail_mask
+                );
+            }
+
+            auto Lb = collect_mistakes_by_obj_(L, bL, Lmask, ctx, Y_eval_bits);
+            auto Rb = collect_mistakes_by_obj_(R, bR, Rmask, ctx, Y_eval_bits);
+
+            if (Lb.empty() || Rb.empty()) continue;
+
+            std::vector<int> R_objs;
+            R_objs.reserve(Rb.size());
+            for (const auto& rb : Rb) {
+                R_objs.push_back(rb.obj);
+            }
+
+            for (const auto& lb : Lb) {
+                const int lo = lb.obj;
+                if (lo > budget) break;
+
+                const int rem = budget - lo;
+
+                auto it_end = std::upper_bound(R_objs.begin(), R_objs.end(), rem);
+                const size_t r_hi = (size_t)std::distance(R_objs.begin(), it_end);
+
+                if (r_hi == 0) continue;
+
+                for (size_t ri = 0; ri < r_hi; ++ri) {
+                    const int ro = Rb[ri].obj;
+                    const int tot = lo + ro;
+
+                    const auto& Lmis = lb.mistakes;
+                    const auto& Rmis = Rb[ri].mistakes;
+
+                    auto& dest = acc[tot];                    
+
+                    for (int lm : Lmis) {
+                        for (int rm : Rmis) {
+                            dest.push_back(lm + rm);
+                        }
+                    }
+                }
+            }
+        }
+
+        return to_sorted_mistake_buckets_(acc);
+    }
+
 public:
     // main entry: enumerate ALL valid trees under the trie root (or budget_override if >=0),
     // returning (training_objective, prediction vector on evaluation dataset) for each tree.
@@ -2887,6 +3118,108 @@ public:
                 out.push_back(PredPackWithObj{b.obj, std::move(p)});
             }
         }
+        return out;
+    }
+
+    std::vector<MistakesWithObj> get_all_misclassifications_objs_packed_trie(
+        const std::vector<std::vector<uint8_t>>& X_row_major,
+        const std::vector<int>& y_eval,
+        int budget_override = -1
+    ) const {
+        if (!result) {
+            throw std::runtime_error("No Rashomon trie has been constructed. Call fit() first.");
+        }
+
+        EvalCtx ctx = build_eval_ctx_(X_row_major, this->n_features);
+
+        if ((int)y_eval.size() != ctx.n_eval) {
+            throw std::runtime_error("Eval y has different number of rows than Eval X.");
+        }
+
+        const int budget = (budget_override >= 0) ? budget_override : result->budget;
+
+        Packed root_mask = eval_root_mask_(ctx.n_words, ctx.tail_mask);
+
+        std::vector<Packed> Y_eval_bits = build_eval_y_bits_(
+            y_eval,
+            num_classes,
+            ctx.n_words,
+            ctx.tail_mask
+        );
+
+        auto buckets = collect_mistakes_by_obj_(
+            result.get(),
+            budget,
+            root_mask,
+            ctx,
+            Y_eval_bits
+        );
+
+        std::vector<MistakesWithObj> out;
+
+        size_t total = 0;
+        for (const auto& b : buckets) {
+            total += b.mistakes.size();
+        }
+        out.reserve(total);
+
+        for (auto& b : buckets) {
+            for (int m : b.mistakes) {
+                out.push_back(MistakesWithObj{b.obj, m});
+            }
+        }
+
+        return out;
+    }
+
+    std::vector<int> get_all_misclassifications_packed_trie(
+        const std::vector<std::vector<uint8_t>>& X_row_major,
+        const std::vector<int>& y_eval,
+        int budget_override = -1
+    ) const {
+        if (!result) {
+            throw std::runtime_error("No Rashomon trie has been constructed. Call fit() first.");
+        }
+
+        EvalCtx ctx = build_eval_ctx_(X_row_major, this->n_features);
+
+        if ((int)y_eval.size() != ctx.n_eval) {
+            throw std::runtime_error("Eval y has different number of rows than Eval X.");
+        }
+
+        const int budget = (budget_override >= 0) ? budget_override : result->budget;
+
+        Packed root_mask = eval_root_mask_(ctx.n_words, ctx.tail_mask);
+
+        std::vector<Packed> Y_eval_bits = build_eval_y_bits_(
+            y_eval,
+            num_classes,
+            ctx.n_words,
+            ctx.tail_mask
+        );
+
+        auto buckets = collect_mistakes_by_obj_(
+            result.get(),
+            budget,
+            root_mask,
+            ctx,
+            Y_eval_bits
+        );
+
+        std::vector<int> out;
+
+        size_t total = 0;
+        for (const auto& b : buckets) {
+            total += b.mistakes.size();
+        }
+        out.reserve(total);
+
+        for (auto& b : buckets) {
+            for (int m : b.mistakes) {
+                out.push_back(m);
+            }
+        }
+
         return out;
     }
 };
