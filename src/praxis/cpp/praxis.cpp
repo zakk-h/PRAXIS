@@ -396,6 +396,12 @@ struct ExportLeafNode {
     int id = -1;
     int parent_trie_id = -1;
     int prediction = -1;
+
+    // gamma + misclassification count for this leaf option
+    int loss = 0;
+
+    // same as parent OR-node subproblem size
+    int subproblem_size = 0;
 };
 
 struct ExportSplitNode {
@@ -404,15 +410,25 @@ struct ExportSplitNode {
     int feature = -1;
     int left_trie_id = -1;
     int right_trie_id = -1;
+
+    // best completion objective if this split is chosen:
+    // left.min_objective + right.min_objective
+    int min_objective = std::numeric_limits<int>::max();
 };
 
 struct ExportTreeTrieNode {
     int id = -1;
 
-    // terminal leaf alternatives directly available at this OR node
-    std::vector<int> leaf_ids;
+    // remaining budget at this OR node
+    int budget = 0;
 
-    // AND/split alternatives directly available at this OR node
+    // best possible completion objective from this OR node
+    int min_objective = std::numeric_limits<int>::max();
+
+    // number of active samples in this subproblem
+    int subproblem_size = 0;
+
+    std::vector<int> leaf_ids;
     std::vector<int> split_ids;
 };
 
@@ -978,9 +994,9 @@ public:
     }
 
     ExportANDORGraph export_andor_graph(
-        std::size_t max_trie_nodes = 2000000000000,
-        std::size_t max_split_nodes = 500000000000,
-        std::size_t max_leaf_nodes = 500000000000
+        std::size_t max_trie_nodes = 2000000000000ULL,
+        std::size_t max_split_nodes = 500000000000ULL,
+        std::size_t max_leaf_nodes = 500000000000ULL
     ) const {
         if (!result) {
             throw std::runtime_error(
@@ -992,6 +1008,14 @@ public:
 
         std::unordered_map<const TreeTrieNode*, int> trie_id;
         std::unordered_set<const TreeTrieNode*> processed;
+
+        auto finite_min_sum = [](int a, int b) -> int {
+            if (a == std::numeric_limits<int>::max() ||
+                b == std::numeric_limits<int>::max()) {
+                return std::numeric_limits<int>::max();
+            }
+            return a + b;
+        };
 
         auto get_trie_id = [&](const std::shared_ptr<TreeTrieNode>& p) -> int {
             if (!p) return -1;
@@ -1012,20 +1036,36 @@ public:
 
             ExportTreeTrieNode node;
             node.id = id;
-            out.trie_nodes.push_back(std::move(node));
+            node.budget = raw->budget;
+            node.min_objective = raw->min_objective;
+            node.subproblem_size = 0;  // filled when processed with its active mask
 
+            out.trie_nodes.push_back(std::move(node));
             return id;
         };
 
+        // Root mask: all training samples active.
+        Packed root_mask(n_words);
+        for (int i = 0; i < n_words - 1; ++i) {
+            root_mask.w[(size_t)i] = ~0ULL;
+        }
+        root_mask.w[(size_t)(n_words - 1)] = tail_mask;
+
         out.root_trie_id = get_trie_id(result);
 
-        std::vector<std::shared_ptr<TreeTrieNode>> stack;
-        stack.push_back(result);
+        struct StackItem {
+            std::shared_ptr<TreeTrieNode> node;
+            Packed mask;
+        };
+
+        std::vector<StackItem> stack;
+        stack.push_back(StackItem{result, root_mask});
 
         while (!stack.empty()) {
-            std::shared_ptr<TreeTrieNode> cur_ptr = stack.back();
+            StackItem item = std::move(stack.back());
             stack.pop_back();
 
+            std::shared_ptr<TreeTrieNode> cur_ptr = item.node;
             if (!cur_ptr) continue;
 
             const TreeTrieNode* cur = cur_ptr.get();
@@ -1033,8 +1073,14 @@ public:
             processed.insert(cur);
 
             const int cur_id = trie_id.at(cur);
+            const int cur_size = item.mask.count();
 
-            // export leaf alternatives.
+            // Fill OR-node metadata.
+            out.trie_nodes[cur_id].budget = cur->budget;
+            out.trie_nodes[cur_id].min_objective = cur->min_objective;
+            out.trie_nodes[cur_id].subproblem_size = cur_size;
+
+            // Export leaf alternatives.
             for (const LeafNode& leaf : cur->leaves) {
                 if (out.leaf_nodes.size() >= max_leaf_nodes) {
                     throw std::runtime_error(
@@ -1047,14 +1093,14 @@ public:
                 e.id = static_cast<int>(out.leaf_nodes.size());
                 e.parent_trie_id = cur_id;
                 e.prediction = leaf.prediction;
+                e.loss = leaf.loss;
+                e.subproblem_size = cur_size;
 
-                // access by index at the moment of mutation.
                 out.trie_nodes[cur_id].leaf_ids.push_back(e.id);
-
                 out.leaf_nodes.push_back(std::move(e));
             }
 
-            // export split / AND alternatives.
+            // Export split / AND alternatives.
             for (const SplitNode& split : cur->splits) {
                 if (!split.left || !split.right) continue;
 
@@ -1065,8 +1111,11 @@ public:
                     );
                 }
 
-                // these calls can push into out.trie_nodes and reallocate it.
-                // we must not hold references into out.trie_nodes across these calls.
+                // Compute child masks only during export.
+                Packed L(n_words), R(n_words);
+                and_bits(item.mask, X_bits[(size_t)split.feature], L);
+                andnot_bits(item.mask, X_bits[(size_t)split.feature], R);
+
                 const int left_id = get_trie_id(split.left);
                 const int right_id = get_trie_id(split.right);
 
@@ -1076,16 +1125,19 @@ public:
                 e.feature = split.feature;
                 e.left_trie_id = left_id;
                 e.right_trie_id = right_id;
+                e.min_objective = finite_min_sum(
+                    split.left->min_objective,
+                    split.right->min_objective
+                );
 
                 out.trie_nodes[cur_id].split_ids.push_back(e.id);
-
                 out.split_nodes.push_back(std::move(e));
 
                 if (processed.find(split.left.get()) == processed.end()) {
-                    stack.push_back(split.left);
+                    stack.push_back(StackItem{split.left, std::move(L)});
                 }
                 if (processed.find(split.right.get()) == processed.end()) {
-                    stack.push_back(split.right);
+                    stack.push_back(StackItem{split.right, std::move(R)});
                 }
             }
         }

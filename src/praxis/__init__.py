@@ -264,6 +264,9 @@ class PRAXIS:
             "trie_nodes": [
                 {
                     "id": int(node.id),
+                    "budget": int(node.budget),
+                    "min_objective": int(node.min_objective),
+                    "subproblem_size": int(node.subproblem_size),
                     "leaf_ids": [int(x) for x in node.leaf_ids],
                     "split_ids": [int(x) for x in node.split_ids],
                 }
@@ -276,6 +279,7 @@ class PRAXIS:
                     "feature": int(split.feature),
                     "left_trie_id": int(split.left_trie_id),
                     "right_trie_id": int(split.right_trie_id),
+                    "min_objective": int(split.min_objective),
                 }
                 for split in g.split_nodes
             ],
@@ -284,6 +288,8 @@ class PRAXIS:
                     "id": int(leaf.id),
                     "parent_trie_id": int(leaf.parent_trie_id),
                     "prediction": int(leaf.prediction),
+                    "loss": int(leaf.loss),
+                    "subproblem_size": int(leaf.subproblem_size),
                 }
                 for leaf in g.leaf_nodes
             ],

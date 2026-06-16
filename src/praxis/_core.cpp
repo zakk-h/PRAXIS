@@ -13,17 +13,23 @@ PYBIND11_MODULE(_core, m) {
     py::class_<ExportLeafNode>(m, "ExportLeafNode")
         .def_readonly("id", &ExportLeafNode::id)
         .def_readonly("parent_trie_id", &ExportLeafNode::parent_trie_id)
-        .def_readonly("prediction", &ExportLeafNode::prediction);
+        .def_readonly("prediction", &ExportLeafNode::prediction)
+        .def_readonly("loss", &ExportLeafNode::loss)
+        .def_readonly("subproblem_size", &ExportLeafNode::subproblem_size);
 
     py::class_<ExportSplitNode>(m, "ExportSplitNode")
         .def_readonly("id", &ExportSplitNode::id)
         .def_readonly("parent_trie_id", &ExportSplitNode::parent_trie_id)
         .def_readonly("feature", &ExportSplitNode::feature)
         .def_readonly("left_trie_id", &ExportSplitNode::left_trie_id)
-        .def_readonly("right_trie_id", &ExportSplitNode::right_trie_id);
+        .def_readonly("right_trie_id", &ExportSplitNode::right_trie_id)
+        .def_readonly("min_objective", &ExportSplitNode::min_objective);
 
     py::class_<ExportTreeTrieNode>(m, "ExportTreeTrieNode")
         .def_readonly("id", &ExportTreeTrieNode::id)
+        .def_readonly("budget", &ExportTreeTrieNode::budget)
+        .def_readonly("min_objective", &ExportTreeTrieNode::min_objective)
+        .def_readonly("subproblem_size", &ExportTreeTrieNode::subproblem_size)
         .def_readonly("leaf_ids", &ExportTreeTrieNode::leaf_ids)
         .def_readonly("split_ids", &ExportTreeTrieNode::split_ids);
 
