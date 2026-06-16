@@ -1236,12 +1236,24 @@ class _InteractiveANDORBuilder:
 
     def _feature_label(self, f):
         f = int(f)
+
+        if f in self.feature_thresholds:
+            group = self.feature_to_group.get(f)
+            thresh = self._format_threshold_value(self.feature_thresholds[f])
+            if group is not None:
+                return f"{group} ≤ {thresh}"
+            return f"f{f} ≤ {thresh}"
+
         if 0 <= f < len(self.feature_names):
             return str(self.feature_names[f])
+
         return f"f{f}"
 
     def _format_threshold_value(self, value):
-        return str(value)
+        try:
+            return f"{float(value):.3f}".rstrip("0").rstrip(".")
+        except Exception:
+            return str(value)
 
     def _continuous_threshold_label(self, f):
         f = int(f)
@@ -1763,15 +1775,15 @@ class _InteractiveANDORBuilder:
 
                     ax.add_line(Line2D(
                         [sx, ex], [sy, ey],
-                        color="#4D4D4D", linewidth=2.2, zorder=1, clip_on=False,
+                        color="#4D4D4D", linewidth=2.8, zorder=1, clip_on=False,
                     ))
 
                     mx = 0.25 * sx + 0.75 * ex
                     my = 0.25 * sy + 0.75 * ey
                     ax.text(
                         mx, my, "T" if is_left else "F",
-                        ha="center", va="center", fontsize=9, color="#333",
-                        bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.9),
+                        ha="center", va="center", fontsize=13, fontweight="bold", color="#333",
+                        bbox=dict(boxstyle="round,pad=0.26", fc="white", ec="none", alpha=0.95),
                         zorder=5, clip_on=False,
                     )
 
