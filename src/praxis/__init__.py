@@ -203,6 +203,7 @@ class PRAXIS:
         proxy_caching=True,
         num_proxy_features=0,
         proxy_only=False,
+        stronger_rollout=False,
     ):
         X = _validate_binary_X(X)
         y = _validate_class_labels(y)
@@ -242,6 +243,7 @@ class PRAXIS:
             bool(proxy_caching),
             int(num_proxy_features),
             bool(rashomon_mode),
+            bool(stronger_rollout),
         )
 
     def count_trees(self):

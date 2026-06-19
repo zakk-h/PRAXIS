@@ -494,6 +494,7 @@ private:
     bool rule_list_mode = false;
     bool majority_leaf_only = false;
     bool cache_cheap_subproblems = false;
+    bool stronger_rollout = false;
     int greedy_split_mode = 1;
     int num_proxy_features = -1; // <=0 means use all feature. positive for feature selection
 
@@ -638,6 +639,7 @@ public:
     void set_cache_cheap_subproblems(bool on) { cache_cheap_subproblems = on; }
     void set_greedy_split_mode(int m) { greedy_split_mode = m; }
     void set_proxy_caching_enabled(bool on) { proxy_caching_enabled = on; }
+    void set_stronger_rollout(bool on) { stronger_rollout = on; }
 
     void fit(const std::vector<std::vector<bool>>& X_col_major,
              const std::vector<int>& y,
@@ -653,7 +655,8 @@ public:
              bool cache_cheap_subproblems_flag,
              bool proxy_caching_flag,
              int num_proxy_features_in,
-             bool rashomon_mode
+             bool rashomon_mode,
+             bool stronger_rollout_flag = false
             ) {
         n_features = (int)X_col_major.size();
         n_samples  = (int)X_col_major[0].size();
@@ -668,6 +671,7 @@ public:
         cache_cheap_subproblems = cache_cheap_subproblems_flag;
         proxy_style = proxy_style_in;
         proxy_caching_enabled = proxy_caching_flag;
+        stronger_rollout = stronger_rollout_flag;
         if (!rashomon_mode) { // force proxy caching on in single-tree mode - required for this codebase
             proxy_caching_enabled = true;
             cache_cheap_subproblems = true;
@@ -1452,7 +1456,10 @@ private:
         if (proxy_caching_enabled) {
             kmask = key_of_subproblem(mask, pk);
             key.k = kmask;
-            if (auto it = greedy_cache.find(key); it != greedy_cache.end()) return it->second; // the objective of the tree returned by the proxy
+
+            if (auto it = greedy_cache.find(key); it != greedy_cache.end()) {
+                return it->second;
+            }
         }
 
         int n_sub = 0;
@@ -1844,6 +1851,8 @@ private:
         const int F = proxy_feat_count_();
         const int8_t child_depth = (int8_t)(depth_budget - 1);
 
+        int best_cached_sum = std::numeric_limits<int>::max();
+
         // ---- k=1 lookahead: evaluate children via GREEDY (because child_k = 0) ----
         for (int f = 0; f < F; ++f) {
             and_bits(mask, X_bits[f], L);
@@ -1855,9 +1864,9 @@ private:
             PathKey pkL_local, pkR_local;
             make_child_pks_if_needed_(f, pk, pkLp, pkRp, pkL_local, pkR_local);
 
-            const int sum =
-                train_greedy(L, child_depth, *pkLp) +
-                train_greedy(R, child_depth, *pkRp);
+            const int left_greedy  = train_greedy(L, child_depth, *pkLp);
+            const int right_greedy = train_greedy(R, child_depth, *pkRp);
+            const int sum = left_greedy + right_greedy;
 
             if (sum < best_sum) {
                 best_sum = sum;
@@ -1865,9 +1874,39 @@ private:
                 bestL.w = L.w;
                 bestR.w = R.w;
             }
+
+            if (stronger_rollout && proxy_caching_enabled) {
+                int left_val = left_greedy;
+                int right_val = right_greedy;
+                bool have_left = false;
+                bool have_right = false;
+
+                const uint64_t kL = key_of_subproblem(L, *pkLp);
+                const uint64_t kR = key_of_subproblem(R, *pkRp);
+
+                if (auto itL = lickety_cache_k2.find(K2{kL, child_depth});
+                    itL != lickety_cache_k2.end()) {
+                    left_val = itL->second;
+                    have_left = true;
+                }
+
+                if (auto itR = lickety_cache_k2.find(K2{kR, child_depth});
+                    itR != lickety_cache_k2.end()) {
+                    right_val = itR->second;
+                    have_right = true;
+                }
+
+                if (have_left || have_right) {
+                    best_cached_sum = std::min(best_cached_sum, left_val + right_val);
+                }
+            }
         }
 
         int ans = leaf_loss;
+
+         if (best_cached_sum != std::numeric_limits<int>::max()) {
+            ans = std::min(ans, best_cached_sum);
+        }
 
         // ---- recurse with constant k=1 (proxy_style=0 behavior) ----
         if (best_feat >= 0) {

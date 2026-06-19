@@ -63,7 +63,8 @@ PYBIND11_MODULE(_core, m) {
                int greedy_split_mode,
                bool proxy_caching,
                int num_proxy_features,
-               bool rashomon_mode
+               bool rashomon_mode,
+               bool stronger_rollout
             ) {
 
                 py::buffer_info xinfo = X.request();
@@ -112,6 +113,7 @@ PYBIND11_MODULE(_core, m) {
                 self.set_greedy_split_mode(greedy_split_mode);
                 self.set_majority_leaf_only(majority_leaf_only);
                 self.set_proxy_caching_enabled(proxy_caching);
+                self.set_stronger_rollout(stronger_rollout);
 
                 self.fit(
                     X_col_major,
@@ -128,7 +130,8 @@ PYBIND11_MODULE(_core, m) {
                     cache_cheap_subproblems,
                     proxy_caching,
                     num_proxy_features,
-                    rashomon_mode
+                    rashomon_mode,
+                    stronger_rollout
                 );
             },
             py::arg("X"),
@@ -149,7 +152,8 @@ PYBIND11_MODULE(_core, m) {
             py::arg("greedy_split_mode") = 1,
             py::arg("proxy_caching") = true,
             py::arg("num_proxy_features") = 0,
-            py::arg("rashomon_mode") = true
+            py::arg("rashomon_mode") = true,
+            py::arg("stronger_rollout") = false
         )
 
         .def("count_trees",
