@@ -255,6 +255,18 @@ class PRAXIS:
     def get_root_histogram(self):
         return self._model.get_root_histogram()
 
+    def count_reconstructed_trie_node_stats(self, as_dict=True):
+        s = self._model.count_reconstructed_trie_node_stats()
+
+        if not as_dict:
+            return s
+
+        return {
+            "total_trie_nodes": int(s.total_trie_nodes),
+            "distinct_subproblem_depth": int(s.distinct_subproblem_depth),
+            "distinct_subproblem_depth_budget": int(s.distinct_subproblem_depth_budget),
+        }
+
     def export_andor_graph(self, as_dict=True):
         g = self._model.export_andor_graph()
 

@@ -39,6 +39,14 @@ PYBIND11_MODULE(_core, m) {
         .def_readonly("split_nodes", &ExportANDORGraph::split_nodes)
         .def_readonly("leaf_nodes", &ExportANDORGraph::leaf_nodes);
 
+    py::class_<TrieNodeCountStats>(m, "TrieNodeCountStats")
+        .def_readonly("total_trie_nodes",
+                    &TrieNodeCountStats::total_trie_nodes)
+        .def_readonly("distinct_subproblem_depth",
+                    &TrieNodeCountStats::distinct_subproblem_depth)
+        .def_readonly("distinct_subproblem_depth_budget",
+                    &TrieNodeCountStats::distinct_subproblem_depth_budget);
+
     py::class_<PRAXIS>(m, "PRAXIS")
         .def(py::init<>())
 
@@ -189,6 +197,16 @@ PYBIND11_MODULE(_core, m) {
                 return self.export_andor_graph();
             },
             "Export the compact AND/OR graph structure of the Rashomon trie."
+        )
+
+        .def(
+            "count_reconstructed_trie_node_stats",
+            [](const PRAXIS &self) {
+                return self.count_reconstructed_trie_node_stats();
+            },
+            "Count reachable TreeTrieNode OR nodes, distinct reconstructed "
+            "(subproblem, depth) pairs, and distinct reconstructed "
+            "(subproblem, depth, budget) triples."
         )
 
         .def(

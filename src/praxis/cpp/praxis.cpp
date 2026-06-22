@@ -459,6 +459,14 @@ struct EvalCtx {
     std::vector<Packed> X_bits_eval; // everything needed for evaluation dataset
 };
 
+struct TrieNodeCountStats {
+    std::size_t total_trie_nodes = 0;
+
+    std::size_t distinct_subproblem_depth = 0;
+
+    std::size_t distinct_subproblem_depth_budget = 0;
+};
+
 
 class PRAXIS {
 public:
@@ -995,6 +1003,99 @@ public:
 
         PathKey root_pk;
         return generalized_lickety_split(root, depth_budget, /*k=*/1, root_pk);
+    }
+
+    TrieNodeCountStats count_reconstructed_trie_node_stats() const {
+        if (!result) {
+            throw std::runtime_error(
+                "No Rashomon trie has been constructed. Call fit(..., rashomon_mode=true) first."
+            );
+        }
+        if (trained_depth_budget < 0) {
+            throw std::runtime_error(
+                "trained_depth_budget not set. Call fit() first."
+            );
+        }
+
+        TrieNodeCountStats stats;
+
+        // unique reachable treetrienodes objects, by pointer identity.
+        std::unordered_set<const TreeTrieNode*> processed;
+
+        // distinct semantic keys reconstructed from active training masks.
+        std::unordered_set<K2, K2::Hash> seen_k2;
+        std::unordered_set<K3, K3::Hash> seen_k3;
+
+        struct StackItem {
+            std::shared_ptr<TreeTrieNode> node;
+            Packed mask;
+            int depth;
+        };
+
+        // root mask: all training samples active.
+        Packed root_mask((size_t)n_words);
+        for (int i = 0; i < n_words - 1; ++i) {
+            root_mask.w[(size_t)i] = ~0ULL;
+        }
+        root_mask.w[(size_t)(n_words - 1)] = tail_mask;
+
+        std::vector<StackItem> stack;
+        stack.push_back(StackItem{
+            result,
+            std::move(root_mask),
+            static_cast<int>(trained_depth_budget)
+        });
+
+        while (!stack.empty()) {
+            StackItem item = std::move(stack.back());
+            stack.pop_back();
+
+            if (!item.node) continue;
+
+            const TreeTrieNode* cur = item.node.get();
+
+            // reconstruct the subproblem id from the active mask.
+            const uint64_t subproblem_key =
+                hash_mask64(item.mask.w.data(), n_words, tail_mask);
+
+            seen_k2.insert(K2{subproblem_key, item.depth});
+            seen_k3.insert(K3{subproblem_key, item.depth, item.node->budget});
+
+            // count / expand each unique treetrienode object once.
+            if (processed.find(cur) != processed.end()) {
+                continue;
+            }
+            processed.insert(cur);
+
+            // reconstruct child masks from the current mask and split feature.
+            for (const SplitNode& split : cur->splits) {
+                if (!split.left || !split.right) continue;
+
+                Packed L((size_t)n_words);
+                Packed R((size_t)n_words);
+
+                and_bits(item.mask, X_bits[(size_t)split.feature], L);
+                andnot_bits(item.mask, X_bits[(size_t)split.feature], R);
+
+                stack.push_back(StackItem{
+                    split.left,
+                    std::move(L),
+                    item.depth - 1
+                });
+
+                stack.push_back(StackItem{
+                    split.right,
+                    std::move(R),
+                    item.depth - 1
+                });
+            }
+        }
+
+        stats.total_trie_nodes = processed.size();
+        stats.distinct_subproblem_depth = seen_k2.size();
+        stats.distinct_subproblem_depth_budget = seen_k3.size();
+
+        return stats;
     }
 
     ExportANDORGraph export_andor_graph(
