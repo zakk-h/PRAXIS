@@ -12,6 +12,7 @@ from IPython.display import display, clear_output
 import json
 import re
 from pathlib import Path
+from importlib.resources import files
 
 __all__ = ["PRAXIS", "ThresholdGuessBinarizer"]
 
@@ -335,6 +336,37 @@ class PRAXIS:
                 for leaf in g.leaf_nodes
             ],
         }
+
+    def save_builder_html(self, path, **kwargs):
+        payload_path = Path(path).with_suffix(".payload.json")
+        self.save_builder_payload(payload_path, **kwargs)
+
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        payload_path.unlink(missing_ok=True)
+
+        payload_json = json.dumps(payload)
+        payload_json = payload_json.replace("</", "<\\/")
+
+        html = files("praxis").joinpath("builder_static/index.html").read_text(
+            encoding="utf-8"
+        )
+
+        inject = f"""
+    <script>
+    window.PRAXIS_BUILDER_PAYLOAD = {payload_json};
+    </script>
+    """
+
+        if "</head>" in html:
+            html = html.replace("</head>", inject + "\n</head>", 1)
+        else:
+            html = inject + html
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(html, encoding="utf-8")
+
+        return path
 
     def save_builder_payload(
         self,
