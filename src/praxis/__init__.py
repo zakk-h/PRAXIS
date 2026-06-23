@@ -2,7 +2,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch, Circle
 from matplotlib.lines import Line2D
-from matplotlib.cm import get_cmap
+import matplotlib
+def get_cmap(name):
+    return matplotlib.colormaps[name]
 from ._core import PRAXIS as _PRAXISCore, rid_subtractive_model_reliance as _rid_subtractive_core
 from ._threshold_guessing import ThresholdGuessBinarizer
 import ipywidgets as widgets
