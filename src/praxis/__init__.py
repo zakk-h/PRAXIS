@@ -7,8 +7,33 @@ from ._core import PRAXIS as _PRAXISCore, rid_subtractive_model_reliance as _rid
 from ._threshold_guessing import ThresholdGuessBinarizer
 import ipywidgets as widgets
 from IPython.display import display, clear_output
+import json
+import re
+from pathlib import Path
 
 __all__ = ["PRAXIS", "ThresholdGuessBinarizer"]
+
+def _json_safe(x):
+    if isinstance(x, (np.integer,)):
+        return int(x)
+    if isinstance(x, (np.floating,)):
+        return float(x)
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    if isinstance(x, dict):
+        return {str(k): _json_safe(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_json_safe(v) for v in x]
+    return x
+
+
+def _guess_thresholds_from_feature_names(feature_names):
+    out = {}
+    for j, s in enumerate(feature_names):
+        m = re.search(r"(<=|>=|<|>|=)\s*(-?\d+(?:\.\d+)?)", str(s))
+        if m:
+            out[int(j)] = float(m.group(2))
+    return out
 
 def _normalize_key(s: str) -> str:
     # lower, trim, and make separators uniform
@@ -308,6 +333,86 @@ class PRAXIS:
                 for leaf in g.leaf_nodes
             ],
         }
+
+    def save_builder_payload(
+        self,
+        path,
+        *,
+        feature_names=None,
+        continuous_groups=None,
+        thresholds=None,
+        binarizer=None,
+        raw_feature_names=None,
+        lambda_reg=None,
+        depth_budget=None,
+        rashomon_mult=None,
+        multiplicative_slack=None,
+        lookahead_k=None,
+        root_n=None,
+        gamma=None,
+        indent=2,
+    ):
+        graph = self.export_andor_graph(as_dict=True)
+
+        if binarizer is not None:
+            if feature_names is None and hasattr(binarizer, "get_feature_names_out"):
+                feature_names = [str(x) for x in binarizer.get_feature_names_out()]
+
+            if raw_feature_names is None and hasattr(binarizer, "feature_names_in_"):
+                raw_feature_names = [str(x) for x in binarizer.feature_names_in_]
+
+            if continuous_groups is None and hasattr(binarizer, "feature_map"):
+                fmap = binarizer.feature_map()
+                if raw_feature_names is None:
+                    continuous_groups = {
+                        str(raw_j): [int(c) for c in cols]
+                        for raw_j, cols in fmap.items()
+                    }
+                else:
+                    continuous_groups = {
+                        str(raw_feature_names[int(raw_j)]): [int(c) for c in cols]
+                        for raw_j, cols in fmap.items()
+                    }
+
+            if thresholds is None and feature_names is not None:
+                thresholds = _guess_thresholds_from_feature_names(feature_names)
+
+        meta = {
+            "featureNames": feature_names,
+            "continuousGroups": continuous_groups,
+            "thresholds": thresholds,
+            "lambda_reg": lambda_reg,
+            "depth_budget": depth_budget,
+            "rashomon_mult": rashomon_mult,
+            "multiplicative_slack": multiplicative_slack,
+            "lookahead_k": lookahead_k,
+            "root_n": root_n,
+            "gamma": gamma,
+        }
+
+        if gamma is None and lambda_reg is not None and root_n is not None:
+            meta["gamma"] = int(round(float(lambda_reg) * int(root_n)))
+
+        root_id = int(graph.get("root_trie_id", 0))
+        root = next(
+            (node for node in graph.get("trie_nodes", []) if int(node.get("id", -1)) == root_id),
+            None,
+        )
+
+        if root is not None:
+            meta["root_budget"] = root.get("budget")
+            meta["root_min_objective"] = root.get("min_objective")
+            meta["root_subproblem_size"] = root.get("subproblem_size")
+
+        payload = {
+            "graph": graph,
+            "meta": {k: v for k, v in meta.items() if v is not None},
+        }
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_json_safe(payload), indent=indent), encoding="utf-8")
+        return path
 
     def interactive_tree_builder(
         self,
