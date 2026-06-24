@@ -434,6 +434,7 @@ class PRAXIS:
         lookahead_k=None,
         root_n=None,
         gamma=None,
+        eta_defer=None,
         indent=2,
     ):
         graph = self.export_andor_graph(as_dict=True)
@@ -472,6 +473,7 @@ class PRAXIS:
             "lookahead_k": lookahead_k,
             "root_n": root_n,
             "gamma": gamma,
+            "eta_defer": eta_defer,
         }
 
         if gamma is None and lambda_reg is not None and root_n is not None:

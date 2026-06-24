@@ -39431,6 +39431,7 @@
     "lookahead_k": 1,
     "root_n": 19020,
     "gamma": 95,
+    "eta_defer": 0.2,
     "root_budget": 3154,
     "root_min_objective": 3100,
     "root_subproblem_size": 19020
