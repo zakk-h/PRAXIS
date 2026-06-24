@@ -2,10 +2,187 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <algorithm>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
+#include <vector>
+
 #include "cpp/praxis.cpp"
 #include "cpp/rid.cpp"
 
 namespace py = pybind11;
+
+namespace {
+
+static inline std::vector<std::vector<uint8_t>>
+numpy_uint8_to_row_major(
+    py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X
+) {
+    py::buffer_info xinfo = X.request();
+
+    if (xinfo.ndim != 2) {
+        throw std::runtime_error("X must be 2D");
+    }
+
+    const int n_samples  = static_cast<int>(xinfo.shape[0]);
+    const int n_features = static_cast<int>(xinfo.shape[1]);
+    auto *x_ptr = static_cast<uint8_t*>(xinfo.ptr);
+
+    std::vector<std::vector<uint8_t>> X_row_major(
+        n_samples,
+        std::vector<uint8_t>(n_features)
+    );
+
+    for (int i = 0; i < n_samples; ++i) {
+        std::memcpy(
+            X_row_major[(size_t)i].data(),
+            x_ptr + (std::size_t)i * (std::size_t)n_features,
+            (std::size_t)n_features * sizeof(uint8_t)
+        );
+    }
+
+    return X_row_major;
+}
+
+static inline std::vector<std::vector<bool>>
+numpy_uint8_to_col_major_bool(
+    py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X
+) {
+    py::buffer_info xinfo = X.request();
+
+    if (xinfo.ndim != 2) {
+        throw std::runtime_error("X must be 2D (n_samples x n_features)");
+    }
+
+    const int n_samples  = static_cast<int>(xinfo.shape[0]);
+    const int n_features = static_cast<int>(xinfo.shape[1]);
+    auto *x_ptr = static_cast<uint8_t*>(xinfo.ptr);
+
+    std::vector<std::vector<bool>> X_col_major(
+        n_features,
+        std::vector<bool>(n_samples)
+    );
+
+    for (int f = 0; f < n_features; ++f) {
+        for (int i = 0; i < n_samples; ++i) {
+            const uint8_t v = x_ptr[(std::size_t)i * (std::size_t)n_features + (std::size_t)f];
+            X_col_major[(size_t)f][(size_t)i] = (v != 0);
+        }
+    }
+
+    return X_col_major;
+}
+
+static inline std::vector<int>
+numpy_int_to_vector(
+    py::array_t<int, py::array::c_style | py::array::forcecast> arr,
+    const char *name
+) {
+    py::buffer_info info = arr.request();
+
+    if (info.ndim != 1) {
+        throw std::runtime_error(std::string(name) + " must be 1D");
+    }
+
+    auto *ptr = static_cast<int*>(info.ptr);
+    const int n = static_cast<int>(info.shape[0]);
+
+    return std::vector<int>(ptr, ptr + n);
+}
+
+static inline std::vector<int>
+optional_numpy_int_to_vector(
+    py::object obj,
+    int expected_n,
+    const char *name
+) {
+    std::vector<int> out;
+
+    if (obj.is_none()) {
+        return out;
+    }
+
+    py::array_t<int, py::array::c_style | py::array::forcecast> arr =
+        obj.cast<py::array_t<int, py::array::c_style | py::array::forcecast>>();
+
+    py::buffer_info info = arr.request();
+
+    if (info.ndim != 1) {
+        throw std::runtime_error(std::string(name) + " must be 1D");
+    }
+
+    if ((int)info.shape[0] != expected_n) {
+        throw std::runtime_error(std::string(name) + " must match X rows");
+    }
+
+    auto *ptr = static_cast<int*>(info.ptr);
+    out.assign(ptr, ptr + expected_n);
+
+    return out;
+}
+
+static inline int numpy_n_rows(
+    py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X
+) {
+    py::buffer_info xinfo = X.request();
+
+    if (xinfo.ndim != 2) {
+        throw std::runtime_error("X must be 2D");
+    }
+
+    return static_cast<int>(xinfo.shape[0]);
+}
+
+static inline int numpy_n_features(
+    py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X
+) {
+    py::buffer_info xinfo = X.request();
+
+    if (xinfo.ndim != 2) {
+        throw std::runtime_error("X must be 2D");
+    }
+
+    return static_cast<int>(xinfo.shape[1]);
+}
+
+static inline py::array_t<uint8_t>
+vector_uint8_to_numpy(const std::vector<uint8_t>& v) {
+    py::array_t<uint8_t> out((py::ssize_t)v.size());
+
+    auto info = out.request();
+    auto *ptr = static_cast<uint8_t*>(info.ptr);
+
+    if (!v.empty()) {
+        std::memcpy(
+            ptr,
+            v.data(),
+            v.size() * sizeof(uint8_t)
+        );
+    }
+
+    return out;
+}
+
+static inline py::array_t<int>
+vector_int_to_numpy(const std::vector<int>& v) {
+    py::array_t<int> out((py::ssize_t)v.size());
+
+    auto info = out.request();
+    auto *ptr = static_cast<int*>(info.ptr);
+
+    if (!v.empty()) {
+        std::memcpy(
+            ptr,
+            v.data(),
+            v.size() * sizeof(int)
+        );
+    }
+
+    return out;
+}
+
+} // namespace
 
 PYBIND11_MODULE(_core, m) {
     m.doc() = "PRAXIS C++ core bindings";
@@ -40,12 +217,18 @@ PYBIND11_MODULE(_core, m) {
         .def_readonly("leaf_nodes", &ExportANDORGraph::leaf_nodes);
 
     py::class_<TrieNodeCountStats>(m, "TrieNodeCountStats")
-        .def_readonly("total_trie_nodes",
-                    &TrieNodeCountStats::total_trie_nodes)
-        .def_readonly("distinct_subproblem_depth",
-                    &TrieNodeCountStats::distinct_subproblem_depth)
-        .def_readonly("distinct_subproblem_depth_budget",
-                    &TrieNodeCountStats::distinct_subproblem_depth_budget);
+        .def_readonly(
+            "total_trie_nodes",
+            &TrieNodeCountStats::total_trie_nodes
+        )
+        .def_readonly(
+            "distinct_subproblem_depth",
+            &TrieNodeCountStats::distinct_subproblem_depth
+        )
+        .def_readonly(
+            "distinct_subproblem_depth_budget",
+            &TrieNodeCountStats::distinct_subproblem_depth_budget
+        );
 
     py::class_<PRAXIS>(m, "PRAXIS")
         .def(py::init<>())
@@ -72,9 +255,11 @@ PYBIND11_MODULE(_core, m) {
                bool proxy_caching,
                int num_proxy_features,
                bool rashomon_mode,
-               bool stronger_rollout
+               bool stronger_rollout,
+               bool use_deferral,
+               double eta_defer,
+               py::object bb_pred_obj
             ) {
-
                 py::buffer_info xinfo = X.request();
                 py::buffer_info yinfo = y.request();
 
@@ -82,35 +267,46 @@ PYBIND11_MODULE(_core, m) {
                     throw std::runtime_error("X must be 2D (n_samples x n_features)");
                 }
 
-                int n_samples  = static_cast<int>(xinfo.shape[0]);
-                int n_features = static_cast<int>(xinfo.shape[1]);
-
-                auto *x_ptr = static_cast<uint8_t*>(xinfo.ptr);
-                auto *y_ptr = static_cast<int*>(yinfo.ptr);
-
-                std::vector<std::vector<bool>> X_col_major(
-                    n_features,
-                    std::vector<bool>(n_samples)
-                );
-
-                for (int f = 0; f < n_features; ++f) {
-                    for (int i = 0; i < n_samples; ++i) {
-                        uint8_t v = x_ptr[i * n_features + f];
-                        X_col_major[f][i] = (v != 0);
-                    }
+                if (yinfo.ndim != 1) {
+                    throw std::runtime_error("y must be 1D");
                 }
 
-                std::vector<int> y_vec(y_ptr, y_ptr + n_samples);
+                const int n_samples = static_cast<int>(xinfo.shape[0]);
+
+                if ((int)yinfo.shape[0] != n_samples) {
+                    throw std::runtime_error("y must match X rows");
+                }
+
+                std::vector<std::vector<bool>> X_col_major =
+                    numpy_uint8_to_col_major_bool(X);
+
+                std::vector<int> y_vec = numpy_int_to_vector(y, "y");
+
+                std::vector<int> bb_pred_vec =
+                    optional_numpy_int_to_vector(
+                        bb_pred_obj,
+                        n_samples,
+                        "bb_pred"
+                    );
+
+                if (use_deferral && bb_pred_vec.empty()) {
+                    throw std::runtime_error("use_deferral=true requires bb_pred");
+                }
 
                 PRAXIS::KeyMode km;
+
                 if (key_mode_str == "exact" || key_mode_str == "bitvector") {
                     km = PRAXIS::KeyMode::EXACT;
-                } else if (key_mode_str == "literal" || key_mode_str == "lits" || key_mode_str == "lits_exact" || key_mode_str == "itemset") {
+                } else if (
+                    key_mode_str == "literal" ||
+                    key_mode_str == "lits" ||
+                    key_mode_str == "lits_exact" ||
+                    key_mode_str == "itemset"
+                ) {
                     km = PRAXIS::KeyMode::LITS_EXACT;
                 } else {
                     km = PRAXIS::KeyMode::HASH64;
                 }
-
 
                 self.set_key_mode(km);
                 self.set_trie_cache_enabled(trie_cache_enabled);
@@ -139,7 +335,10 @@ PYBIND11_MODULE(_core, m) {
                     proxy_caching,
                     num_proxy_features,
                     rashomon_mode,
-                    stronger_rollout
+                    stronger_rollout,
+                    use_deferral,
+                    eta_defer,
+                    bb_pred_vec
                 );
             },
             py::arg("X"),
@@ -161,35 +360,49 @@ PYBIND11_MODULE(_core, m) {
             py::arg("proxy_caching") = true,
             py::arg("num_proxy_features") = 0,
             py::arg("rashomon_mode") = true,
-            py::arg("stronger_rollout") = false
+            py::arg("stronger_rollout") = false,
+            py::arg("use_deferral") = false,
+            py::arg("eta_defer") = 0.0,
+            py::arg("bb_pred") = py::none()
         )
 
-        .def("count_trees",
-             [](PRAXIS &self) {
-                 return self.result ? self.result->count_trees() : 0ULL;
-             })
+        .def(
+            "count_trees",
+            [](PRAXIS &self) {
+                return self.result ? self.result->count_trees() : 0ULL;
+            }
+        )
 
-        .def("get_min_objective",
-             [](PRAXIS &self) {
-                 return self.result
-                        ? self.result->min_objective
-                        : std::numeric_limits<int>::max();
-             })
+        .def(
+            "get_min_objective",
+            [](PRAXIS &self) {
+                return self.result
+                    ? self.result->min_objective
+                    : std::numeric_limits<int>::max();
+            }
+        )
 
-        .def("get_root_histogram",
-             [](PRAXIS &self) {
-                 if (!self.result) {
-                     return std::vector<std::pair<int, std::uint64_t>>{};
-                 }
-                 self.result->ensure_hist_built();
-                 const auto &hist = self.result->hist;
-                 std::vector<std::pair<int, std::uint64_t>> out;
-                 out.reserve(hist.size());
-                 for (const auto &e : hist) {
-                     out.emplace_back(e.obj, e.cnt);
-                 }
-                 return out;
-             })
+        .def(
+            "get_root_histogram",
+            [](PRAXIS &self) {
+                if (!self.result) {
+                    return std::vector<std::pair<int, std::uint64_t>>{};
+                }
+
+                self.result->ensure_hist_built();
+
+                const auto &hist = self.result->hist;
+
+                std::vector<std::pair<int, std::uint64_t>> out;
+                out.reserve(hist.size());
+
+                for (const auto &e : hist) {
+                    out.emplace_back(e.obj, e.cnt);
+                }
+
+                return out;
+            }
+        )
 
         .def(
             "export_andor_graph",
@@ -213,99 +426,104 @@ PYBIND11_MODULE(_core, m) {
             "get_predictions",
             [](const PRAXIS &self,
                std::uint64_t tree_index,
-               py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X) {
-                py::buffer_info xinfo = X.request();
-                if (xinfo.ndim != 2) {
-                    throw std::runtime_error("X must be 2D (n_samples x n_features)");
-                }
+               py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X,
+               py::object bb_pred_obj,
+               int defer_placeholder
+            ) {
+                const int n_samples = numpy_n_rows(X);
 
-                int n_samples  = static_cast<int>(xinfo.shape[0]);
-                int n_features = static_cast<int>(xinfo.shape[1]);
-                auto *x_ptr = static_cast<uint8_t*>(xinfo.ptr);
+                std::vector<std::vector<uint8_t>> X_row_major =
+                    numpy_uint8_to_row_major(X);
 
-                std::vector<std::vector<uint8_t>> X_row_major(
-                    n_samples, std::vector<uint8_t>(n_features));
-                for (int i = 0; i < n_samples; ++i) {
-                    for (int f = 0; f < n_features; ++f) {
-                        X_row_major[i][f] = x_ptr[i * n_features + f];
-                    }
-                }
+                std::vector<int> bb_pred_vec =
+                    optional_numpy_int_to_vector(
+                        bb_pred_obj,
+                        n_samples,
+                        "bb_pred"
+                    );
 
-                auto preds = self.get_predictions(tree_index, X_row_major);
+                auto preds = self.get_predictions(
+                    tree_index,
+                    X_row_major,
+                    bb_pred_vec,
+                    defer_placeholder
+                );
 
-                py::array_t<uint8_t> out(n_samples);
-                auto out_info = out.request();
-                auto *out_ptr = static_cast<uint8_t*>(out_info.ptr);
-                std::memcpy(
-                    out_ptr, preds.data(),
-                    static_cast<std::size_t>(n_samples) * sizeof(uint8_t));
-                return out;
+                return vector_uint8_to_numpy(preds);
             },
             py::arg("tree_index"),
-            py::arg("X")
+            py::arg("X"),
+            py::arg("bb_pred") = py::none(),
+            py::arg("defer_placeholder") = 99
         )
 
         .def(
             "get_all_predictions",
             [](const PRAXIS &self,
                py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X,
-               bool stack) {
-                py::buffer_info xinfo = X.request();
-                if (xinfo.ndim != 2) {
-                    throw std::runtime_error("X must be 2D (n_samples x n_features)");
-                }
+               bool stack,
+               py::object bb_pred_obj,
+               int defer_placeholder
+            ) {
+                const int n_samples = numpy_n_rows(X);
 
-                int n_samples  = static_cast<int>(xinfo.shape[0]);
-                int n_features = static_cast<int>(xinfo.shape[1]);
-                auto *x_ptr = static_cast<uint8_t*>(xinfo.ptr);
+                std::vector<std::vector<uint8_t>> X_row_major =
+                    numpy_uint8_to_row_major(X);
 
-                std::vector<std::vector<uint8_t>> X_row_major(
-                    n_samples, std::vector<uint8_t>(n_features));
-                for (int i = 0; i < n_samples; ++i) {
-                    for (int f = 0; f < n_features; ++f) {
-                        X_row_major[i][f] = x_ptr[i * n_features + f];
-                    }
-                }
+                std::vector<int> bb_pred_vec =
+                    optional_numpy_int_to_vector(
+                        bb_pred_obj,
+                        n_samples,
+                        "bb_pred"
+                    );
 
-                auto all_preds = self.get_all_predictions(X_row_major);
-                std::uint64_t total = all_preds.size();
+                auto all_preds = self.get_all_predictions(
+                    X_row_major,
+                    bb_pred_vec,
+                    defer_placeholder
+                );
+
+                const std::uint64_t total = all_preds.size();
 
                 if (!stack) {
                     py::list lst;
+
                     for (std::uint64_t t = 0; t < total; ++t) {
-                        py::array_t<uint8_t> arr(n_samples);
-                        auto info = arr.request();
-                        auto *ptr = static_cast<uint8_t*>(info.ptr);
-                        std::memcpy(
-                            ptr,
-                            all_preds[t].data(),
-                            static_cast<std::size_t>(n_samples) * sizeof(uint8_t));
-                        lst.append(arr);
+                        lst.append(vector_uint8_to_numpy(all_preds[(size_t)t]));
                     }
+
                     return py::object(lst);
-                } else {
-                    py::array_t<uint8_t> out(
-                        {static_cast<py::ssize_t>(total),
-                         static_cast<py::ssize_t>(n_samples)});
-                    auto out_info = out.request();
-                    auto *out_ptr = static_cast<uint8_t*>(out_info.ptr);
-                    for (std::uint64_t t = 0; t < total; ++t) {
-                        std::memcpy(
-                            out_ptr + t * n_samples,
-                            all_preds[t].data(),
-                            static_cast<std::size_t>(n_samples) * sizeof(uint8_t));
-                    }
-                    return py::object(out);
                 }
+
+                py::array_t<uint8_t> out(
+                    {static_cast<py::ssize_t>(total),
+                     static_cast<py::ssize_t>(n_samples)}
+                );
+
+                auto out_info = out.request();
+                auto *out_ptr = static_cast<uint8_t*>(out_info.ptr);
+
+                for (std::uint64_t t = 0; t < total; ++t) {
+                    std::memcpy(
+                        out_ptr + (std::size_t)t * (std::size_t)n_samples,
+                        all_preds[(size_t)t].data(),
+                        static_cast<std::size_t>(n_samples) * sizeof(uint8_t)
+                    );
+                }
+
+                return py::object(out);
             },
             py::arg("X"),
-            py::arg("stack") = false
+            py::arg("stack") = false,
+            py::arg("bb_pred") = py::none(),
+            py::arg("defer_placeholder") = 99
         )
 
         .def(
             "get_tree_objective",
             [](const PRAXIS &self, std::uint64_t tree_index) {
                 auto obj_pair = self.get_ith_tree_objective(tree_index);
+
                 // obj_pair.first  = unnormalized objective (int)
                 // obj_pair.second = normalized objective (double)
                 return py::make_tuple(obj_pair.first, obj_pair.second);
@@ -317,21 +535,26 @@ PYBIND11_MODULE(_core, m) {
             "get_tree_paths",
             [](const PRAXIS &self, std::uint64_t tree_index) {
                 auto result = self.get_tree_paths(tree_index);
+
                 const auto &paths = result.first;
                 const auto &preds = result.second;
 
                 py::list py_paths;
+
                 for (const auto &p : paths) {
                     py::list py_path;
+
                     for (int v : p) {
                         py_path.append(v);
                     }
+
                     py_paths.append(py_path);
                 }
 
-                py::array_t<int> py_preds(preds.size());
+                py::array_t<int> py_preds((py::ssize_t)preds.size());
                 auto info = py_preds.request();
                 auto *ptr = static_cast<int*>(info.ptr);
+
                 for (std::size_t i = 0; i < preds.size(); ++i) {
                     ptr[i] = preds[i];
                 }
@@ -347,65 +570,166 @@ PYBIND11_MODULE(_core, m) {
                 return self.root_lickety_objective_lookahead1(depth_budget);
             },
             py::arg("depth_budget")
+        )
+
+        .def(
+            "get_all_misclassifications_packed_trie",
+            [](const PRAXIS &self,
+               py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X,
+               py::array_t<int,     py::array::c_style | py::array::forcecast> y,
+               int budget_override,
+               py::object bb_pred_obj
+            ) {
+                const int n_samples = numpy_n_rows(X);
+
+                py::buffer_info yinfo = y.request();
+                if (yinfo.ndim != 1) {
+                    throw std::runtime_error("y must be 1D");
+                }
+                if ((int)yinfo.shape[0] != n_samples) {
+                    throw std::runtime_error("y must match X rows");
+                }
+
+                std::vector<std::vector<uint8_t>> X_row_major =
+                    numpy_uint8_to_row_major(X);
+
+                std::vector<int> y_vec = numpy_int_to_vector(y, "y");
+
+                std::vector<int> bb_pred_vec =
+                    optional_numpy_int_to_vector(
+                        bb_pred_obj,
+                        n_samples,
+                        "bb_pred"
+                    );
+
+                std::vector<int> out = self.get_all_misclassifications_packed_trie(
+                    X_row_major,
+                    y_vec,
+                    budget_override,
+                    bb_pred_vec
+                );
+
+                return vector_int_to_numpy(out);
+            },
+            py::arg("X"),
+            py::arg("y"),
+            py::arg("budget_override"),
+            py::arg("bb_pred") = py::none()
+        )
+
+        .def(
+            "get_all_deferrals_packed_trie",
+            [](const PRAXIS &self,
+               py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X,
+               int budget_override
+            ) {
+                std::vector<std::vector<uint8_t>> X_row_major =
+                    numpy_uint8_to_row_major(X);
+
+                std::vector<int> out = self.get_all_deferrals_packed_trie(
+                    X_row_major,
+                    budget_override
+                );
+
+                return vector_int_to_numpy(out);
+            },
+            py::arg("X"),
+            py::arg("budget_override")
         );
 
     m.def(
         "rid_subtractive_model_reliance",
         [](py::array_t<uint8_t, py::array::c_style | py::array::forcecast> X,
-        py::array_t<int,     py::array::c_style | py::array::forcecast> y,
-        int n_boot,
-        double lambda_reg,
-        int depth_budget,
-        double rashomon_mult,
-        int lookahead_k,
-        std::uint64_t seed,
-        bool memory_efficient,
-        py::object binning_map_obj ) {
+           py::array_t<int,     py::array::c_style | py::array::forcecast> y,
+           int n_boot,
+           double lambda_reg,
+           int depth_budget,
+           double rashomon_mult,
+           int lookahead_k,
+           std::uint64_t seed,
+           bool memory_efficient,
+           py::object binning_map_obj,
+           bool use_deferral,
+           double eta_defer,
+           py::object bb_pred_obj
+        ) {
             py::buffer_info xinfo = X.request();
             py::buffer_info yinfo = y.request();
 
-            if (xinfo.ndim != 2) throw std::runtime_error("X must be 2D");
-            if (yinfo.ndim != 1) throw std::runtime_error("y must be 1D");
-
-            int n_samples  = (int)xinfo.shape[0];
-            int n_features = (int)xinfo.shape[1];
-            if ((int)yinfo.shape[0] != n_samples) throw std::runtime_error("y must match X rows");
-
-            auto *x_ptr = static_cast<uint8_t*>(xinfo.ptr);
-            auto *y_ptr = static_cast<int*>(yinfo.ptr);
-
-            // build row-major X
-            std::vector<std::vector<uint8_t>> X_row_major(n_samples, std::vector<uint8_t>(n_features));
-            for (int i = 0; i < n_samples; ++i) {
-                std::memcpy(X_row_major[i].data(),
-                            x_ptr + (std::size_t)i * (std::size_t)n_features,
-                            (std::size_t)n_features * sizeof(uint8_t));
+            if (xinfo.ndim != 2) {
+                throw std::runtime_error("X must be 2D");
             }
 
-            std::vector<int> y_vec(y_ptr, y_ptr + n_samples);   
-            
-            // binning map stuff
-            int d = n_features;
+            if (yinfo.ndim != 1) {
+                throw std::runtime_error("y must be 1D");
+            }
+
+            const int n_samples  = (int)xinfo.shape[0];
+            const int n_features = (int)xinfo.shape[1];
+
+            if ((int)yinfo.shape[0] != n_samples) {
+                throw std::runtime_error("y must match X rows");
+            }
+
+            std::vector<std::vector<uint8_t>> X_row_major =
+                numpy_uint8_to_row_major(X);
+
+            std::vector<int> y_vec = numpy_int_to_vector(y, "y");
+
+            std::vector<int> bb_pred_vec =
+                optional_numpy_int_to_vector(
+                    bb_pred_obj,
+                    n_samples,
+                    "bb_pred"
+                );
+
+            if (use_deferral && bb_pred_vec.empty()) {
+                throw std::runtime_error("use_deferral=true requires bb_pred");
+            }
+
+            // binning map.
+            // if binning_map is None, each binary column is its own feature group.
             std::vector<std::vector<int>> groups;
+
             if (binning_map_obj.is_none()) {
-                groups.resize(d);
-                for (int j = 0; j < d; ++j) groups[j] = {j};
+                groups.resize((size_t)n_features);
+
+                for (int j = 0; j < n_features; ++j) {
+                    groups[(size_t)j] = std::vector<int>{j};
+                }
             } else {
                 py::dict bm = binning_map_obj.cast<py::dict>();
 
                 std::vector<int> keys;
-                for (auto item : bm) keys.push_back(py::cast<int>(item.first));
+                for (auto item : bm) {
+                    keys.push_back(py::cast<int>(item.first));
+                }
+
                 std::sort(keys.begin(), keys.end());
 
                 groups.reserve(keys.size());
+
                 for (int k : keys) {
                     py::list lst = bm[py::int_(k)].cast<py::list>();
+
                     std::vector<int> cols;
-                    for (auto h : lst) cols.push_back(py::cast<int>(h));
+                    cols.reserve((size_t)py::len(lst));
+
+                    for (auto h : lst) {
+                        const int col = py::cast<int>(h);
+
+                        if (col < 0 || col >= n_features) {
+                            throw std::runtime_error(
+                                "binning_map contains column index outside [0, n_features)"
+                            );
+                        }
+
+                        cols.push_back(col);
+                    }
+
                     groups.push_back(std::move(cols));
                 }
             }
-
 
             RIDResult r = compute_rid_subtractive_mr_bootstrap(
                 X_row_major,
@@ -417,13 +741,17 @@ PYBIND11_MODULE(_core, m) {
                 lookahead_k,
                 seed,
                 memory_efficient,
-                groups
+                groups,
+                use_deferral,
+                eta_defer,
+                bb_pred_vec
             );
 
             py::dict out;
-            out["mean_sub_mr"] = r.mean_sub_mr; // vector<double>
-            out["cdf_x"] = r.cdf_x; // vector<vector<double>>
-            out["cdf_p"] = r.cdf_p; // vector<vector<double>>
+            out["mean_sub_mr"] = r.mean_sub_mr;
+            out["cdf_x"] = r.cdf_x;
+            out["cdf_p"] = r.cdf_p;
+
             return out;
         },
         py::arg("X"),
@@ -435,8 +763,9 @@ PYBIND11_MODULE(_core, m) {
         py::arg("lookahead_k") = 1,
         py::arg("seed") = 0,
         py::arg("memory_efficient") = false,
-        py::arg("binning_map") = py::none()
+        py::arg("binning_map") = py::none(),
+        py::arg("use_deferral") = false,
+        py::arg("eta_defer") = 0.0,
+        py::arg("bb_pred") = py::none()
     );
-
-
 }

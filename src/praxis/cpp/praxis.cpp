@@ -27,6 +27,7 @@ using namespace std;
 
 using Lit = uint16_t; // 16-bit literal = 2*feat + sign
 using PathKey = std::vector<Lit>;
+static constexpr int DEFER_PREDICTION = -1;
 
 struct Packed {
     vector<uint64_t> w; // words (64-bit each)
@@ -92,6 +93,7 @@ static inline void pk_erase_sorted(PathKey& pk, Lit lit) {
 
 struct PackedPredMulti {
     std::vector<Packed> by_class; // size = num_classes, each is n_words over eval rows
+    Packed deferred; // rows deferred by this tree
 };
 
 // bucket by objective
@@ -220,8 +222,13 @@ static inline bool hist_less(const HistEntry& a, const HistEntry& b){ return a.o
 struct TreeTrieNode; // fwd
 
 struct LeafNode {
-    int prediction; // 0/1 (kept for completeness)
-    int loss;       // gamma + miscls
+    // 0..C-1 means predict class.
+    // DEFER_PREDICTION means defer to black-box.
+    int prediction;
+
+    //   predict leaf: gamma + mistakes
+    //   defer leaf:   gamma + round(eta_defer * n_leaf) + bb_mistakes
+    int loss;
 };
 
 struct SplitNode {
@@ -490,6 +497,14 @@ private:
     int num_classes = 0;
     std::vector<Packed> Y_bits; // vector is size size num_classes; Y_bits[c] has 1s where y==c
 
+    // deferral support.
+    bool use_deferral = false;
+    double eta_defer = 0.0;
+
+    // training rows where black-box is wrong: bb_pred[i] != y[i].
+    // used to compute defer leaf objective.
+    Packed BBwrong;
+
 
     KeyMode key_mode = KeyMode::HASH64; // will change later in fit
     bool trie_cache_enabled = false;
@@ -664,13 +679,27 @@ public:
              bool proxy_caching_flag,
              int num_proxy_features_in,
              bool rashomon_mode,
-             bool stronger_rollout_flag = false
+             bool stronger_rollout_flag = false,
+             bool use_deferral_flag = false,
+             double eta_defer_in = 0.0,
+             const std::vector<int>& bb_pred = {}
             ) {
         n_features = (int)X_col_major.size();
         n_samples  = (int)X_col_major[0].size();
         n_words = (n_samples + 63) / 64; // 64 -> 1, 65 -> 2
         tail_mask = (n_samples % 64) ? ((1ULL << (n_samples % 64)) - 1ULL) : ~0ULL; // if multiple of 64, all 1s. otherwise, n_samples % 64 1s followed by 0s.
         gamma = (int)llround(lambda * (double)n_samples);
+        use_deferral = use_deferral_flag;
+        eta_defer = eta_defer_in;
+
+        if (use_deferral) {
+            if ((int)bb_pred.size() != (int)y.size()) {
+                throw std::runtime_error("fit: use_deferral=true requires bb_pred with same length as y.");
+            }
+            if (!std::isfinite(eta_defer) || eta_defer < 0.0) {
+                throw std::runtime_error("fit: eta_defer must be finite and nonnegative.");
+            }
+        }
         trained_depth_budget = depth_budget;
         lookahead_init = lookahead_k;
         use_multipass = use_multipass_flag;
@@ -721,6 +750,27 @@ public:
         }
         for (int c = 0; c < num_classes; ++c) {
             Y_bits[(size_t)c].w[(size_t)(n_words - 1)] &= tail_mask;
+        }
+
+        BBwrong = Packed((size_t)n_words);
+        BBwrong.clear();
+
+        if (use_deferral) {
+            for (int i = 0; i < n_samples; ++i) {
+                const int bi = bb_pred[(size_t)i];
+
+                if (bi < 0 || bi >= num_classes) {
+                    throw std::runtime_error(
+                        "fit: bb_pred values must be in the same class range as y."
+                    );
+                }
+
+                if (bi != y[(size_t)i]) {
+                    BBwrong.w[(size_t)(i >> 6)] |= (1ULL << (i & 63));
+                }
+            }
+
+            BBwrong.w[(size_t)(n_words - 1)] &= tail_mask;
         }
 
         Packed root(n_words);
@@ -802,7 +852,12 @@ public:
     }
 
     // predict using the i-th tree in the Rashomon set: X_row_major: binary [n_samples][n_features]
-    std::vector<uint8_t> get_predictions(uint64_t tree_index, const std::vector<std::vector<uint8_t>>& X_row_major) const {
+    std::vector<uint8_t> get_predictions(
+        uint64_t tree_index,
+        const std::vector<std::vector<uint8_t>>& X_row_major,
+        const std::vector<int>& bb_pred_row = {},
+        int defer_placeholder = 99
+    ) const {
         const std::size_t n_samples = X_row_major.size();
         if (n_samples == 0) return {};
 
@@ -843,21 +898,42 @@ public:
             idx[i] = static_cast<int>(i);
         }
 
-        predict_tree_recursive(tree.get(), X_row_major, out, idx);
+        // predict_tree_recursive(tree.get(), X_row_major, out, idx);
+        const bool use_placeholder = bb_pred_row.empty();
+
+        if (!use_placeholder && bb_pred_row.size() != n_samples) {
+            throw std::runtime_error("Prediction bb_pred_row has different number of rows than X.");
+        }
+
+        predict_tree_recursive(
+            tree.get(),
+            X_row_major,
+            bb_pred_row,
+            out,
+            idx,
+            use_placeholder,
+            defer_placeholder
+        );
         return out;
     }
 
 
     // get predictions from all trees in the rashomon set, as a vector of prediction vectors (one per tree).
     std::vector<std::vector<uint8_t>> get_all_predictions(
-        const std::vector<std::vector<uint8_t>>& X_row_major
+        const std::vector<std::vector<uint8_t>>& X_row_major,
+        const std::vector<int>& bb_pred_row = {},
+        int defer_placeholder = 99
     ) const {
         uint64_t total = result ? result->count_trees() : 0ULL;
         std::vector<std::vector<uint8_t>> all;
         all.reserve(static_cast<std::size_t>(total));
+
         for (uint64_t i = 0; i < total; ++i) {
-            all.push_back(get_predictions(i, X_row_major));
+            all.push_back(
+                get_predictions(i, X_row_major, bb_pred_row, defer_placeholder)
+            );
         }
+
         return all;
     }
 
@@ -1268,25 +1344,31 @@ private:
 
         if (num_classes == 2) {
             int pos = 0;
-            count_total_pos_binary(mask, n_sub, pos);
+            int bb_wrong = 0;
+            count_total_pos_bbwrong_binary(mask, n_sub, pos, bb_wrong);
+
+            const int neg = n_sub - pos;
 
             if (!majority_leaf_only) {
-                // predict 0: mistakes are positives
                 const int cost0 = gamma + pos;
-
-                // predict 1: mistakes are negatives
-                const int cost1 = gamma + (n_sub - pos);
+                const int cost1 = gamma + neg;
 
                 if (cost0 <= budget) node->add_leaf(0, cost0);
                 if (cost1 <= budget) node->add_leaf(1, cost1);
             } else {
-                // choose majority class; tie breaks toward class 1
-                const int neg = n_sub - pos;
                 const int best_c = (pos >= neg) ? 1 : 0;
-                const int mis = std::min(pos, neg);
-                const int best_cost = gamma + mis;
+                const int best_cost = gamma + std::min(pos, neg);
 
                 if (best_cost <= budget) node->add_leaf(best_c, best_cost);
+            }
+
+            if (use_deferral && n_sub > 0) {
+                const int defer_cost =
+                    gamma + defer_penalty_from_count_(n_sub) + bb_wrong;
+
+                if (defer_cost <= budget) {
+                    node->add_leaf(DEFER_PREDICTION, defer_cost);
+                }
             }
         } else {
             n_sub = count_total(mask);
@@ -1315,6 +1397,19 @@ private:
                 const int mis = n_sub - best_cnt;
                 const int best_cost = gamma + mis;
                 if (best_cost <= budget) node->add_leaf(best_c, best_cost);
+            }
+
+            // defer leaf is an additional leaf option.
+            if (use_deferral && n_sub > 0) {
+                const int bb_wrong = count_bb_wrong(mask);
+                const int defer_cost =
+                    gamma
+                    + defer_penalty_from_count_(n_sub)
+                    + bb_wrong;
+
+                if (defer_cost <= budget) {
+                    node->add_leaf(DEFER_PREDICTION, defer_cost);
+                }
             }
         }
 
@@ -1496,26 +1591,54 @@ private:
         }
     }
 
-    int leaf_objective(const Packed& mask) const {
-        if (num_classes == 2) {
-            int n_sub, pos;
-            count_total_pos_binary(mask, n_sub, pos);
+    inline void count_total_pos_bbwrong_binary(
+        const Packed& mask,
+        int& n,
+        int& pos,
+        int& bb_wrong
+    ) const {
+        n = 0;
+        pos = 0;
+        bb_wrong = 0;
 
-            if (n_sub == 0) return 0;
+        const Packed& Ypos = Y_bits[(size_t)1];
 
-            return gamma + std::min(pos, n_sub - pos);
+        if (use_deferral) {
+            for (int i = 0; i < n_words; ++i) {
+                const uint64_t mw = mask.w[(size_t)i];
+                n        += popcnt64(mw);
+                pos      += popcnt64(mw & Ypos.w[(size_t)i]);
+                bb_wrong += popcnt64(mw & BBwrong.w[(size_t)i]);
+            }
+        } else {
+            for (int i = 0; i < n_words; ++i) {
+                const uint64_t mw = mask.w[(size_t)i];
+                n   += popcnt64(mw);
+                pos += popcnt64(mw & Ypos.w[(size_t)i]);
+            }
         }
-
-        const int n_sub = count_total(mask);
-        if (n_sub == 0) return 0;
-
-        int best_cnt = 0;
-        for (int c = 0; c < num_classes; ++c) {
-            best_cnt = std::max(best_cnt, count_class(mask, c));
-        }
-        const int mis = n_sub - best_cnt;
-        return gamma + mis;
     }
+
+    // int leaf_objective(const Packed& mask) const {
+    //     if (num_classes == 2) {
+    //         int n_sub, pos;
+    //         count_total_pos_binary(mask, n_sub, pos);
+
+    //         if (n_sub == 0) return 0;
+
+    //         return gamma + std::min(pos, n_sub - pos);
+    //     }
+
+    //     const int n_sub = count_total(mask);
+    //     if (n_sub == 0) return 0;
+
+    //     int best_cnt = 0;
+    //     for (int c = 0; c < num_classes; ++c) {
+    //         best_cnt = std::max(best_cnt, count_class(mask, c));
+    //     }
+    //     const int mis = n_sub - best_cnt;
+    //     return gamma + mis;
+    // }
 
     inline void make_child_pks_if_needed_(
         int feat,
@@ -1537,9 +1660,131 @@ private:
         }
     }
 
-    inline int leaf_objective_binary_from_counts(int n_sub, int pos) const {
+    // inline int leaf_objective_binary_from_counts(int n_sub, int pos) const {
+    //     if (n_sub == 0) return 0;
+    //     return gamma + std::min(pos, n_sub - pos);
+    // }
+
+    struct BestLeafAction {
+        int prediction = 0; // 0..C-1, or DEFER_PREDICTION
+        int loss = 0;
+    };
+
+    inline int defer_penalty_from_count_(int n_sub) const {
+        return (int)llround(eta_defer * (double)n_sub);
+    }
+
+    inline int count_bb_wrong(const Packed& mask) const {
+        if (!use_deferral) return 0;
+        return popcount_and(mask, BBwrong);
+    }
+
+    inline int predict_leaf_objective_binary_from_counts(int n_sub, int pos) const {
         if (n_sub == 0) return 0;
         return gamma + std::min(pos, n_sub - pos);
+    }
+
+    inline int leaf_objective_binary_from_counts(int n_sub, int pos) const {
+        return leaf_objective_binary_from_counts(n_sub, pos, 0);
+    }
+
+    inline int leaf_objective_binary_from_counts(
+        int n_sub,
+        int pos,
+        int bb_wrong
+    ) const {
+        if (n_sub == 0) return 0;
+
+        const int predict_loss = gamma + std::min(pos, n_sub - pos);
+
+        if (!use_deferral) {
+            return predict_loss;
+        }
+
+        const int defer_loss =
+            gamma
+            + defer_penalty_from_count_(n_sub)
+            + bb_wrong;
+
+        return std::min(predict_loss, defer_loss);
+    }
+
+    BestLeafAction best_leaf_action(const Packed& mask) const {
+        if (num_classes == 2) {
+            int n_sub = 0;
+            int pos = 0;
+            int bb_wrong = 0;
+
+            count_total_pos_bbwrong_binary(mask, n_sub, pos, bb_wrong);
+
+            if (n_sub == 0) {
+                return BestLeafAction{0, 0};
+            }
+
+            const int neg = n_sub - pos;
+
+            BestLeafAction best;
+            if (pos >= neg) {
+                best.prediction = 1;
+                best.loss = gamma + neg;
+            } else {
+                best.prediction = 0;
+                best.loss = gamma + pos;
+            }
+
+            if (use_deferral) {
+                const int defer_loss =
+                    gamma
+                    + defer_penalty_from_count_(n_sub)
+                    + bb_wrong;
+
+                if (defer_loss < best.loss) {
+                    best.prediction = DEFER_PREDICTION;
+                    best.loss = defer_loss;
+                }
+            }
+
+            return best;
+        }
+
+        const int n_sub = count_total(mask);
+        if (n_sub == 0) {
+            return BestLeafAction{0, 0};
+        }
+
+        int best_pred = 0;
+        int best_cnt = -1;
+
+        for (int c = 0; c < num_classes; ++c) {
+            const int cnt = count_class(mask, c);
+            if (cnt > best_cnt || (cnt == best_cnt && c > best_pred)) {
+                best_cnt = cnt;
+                best_pred = c;
+            }
+        }
+
+        BestLeafAction best;
+        best.prediction = best_pred;
+        best.loss = gamma + (n_sub - best_cnt);
+
+        if (use_deferral) {
+            const int bb_wrong = count_bb_wrong(mask);
+            const int defer_loss =
+                gamma
+                + defer_penalty_from_count_(n_sub)
+                + bb_wrong;
+
+            if (defer_loss < best.loss) {
+                best.prediction = DEFER_PREDICTION;
+                best.loss = defer_loss;
+            }
+        }
+
+        return best;
+    }
+
+    int leaf_objective(const Packed& mask) const {
+        return best_leaf_action(mask).loss;
     }
 
 
@@ -1565,11 +1810,12 @@ private:
 
         int n_sub = 0;
         int pos = 0;
+        int bb_wrong = 0;
         int leaf_loss = 0;
 
         if (num_classes == 2) {
-            count_total_pos_binary(mask, n_sub, pos);
-            leaf_loss = leaf_objective_binary_from_counts(n_sub, pos);
+            count_total_pos_bbwrong_binary(mask, n_sub, pos, bb_wrong);
+            leaf_loss = leaf_objective_binary_from_counts(n_sub, pos, bb_wrong);
         } else {
             n_sub = count_total(mask);
             leaf_loss = leaf_objective(mask);
@@ -1596,7 +1842,13 @@ private:
         // choose split via entropy gain
         int best_feat;
         if (num_classes == 2) {
-            best_feat = find_best_split_binary_known_counts(mask, n_sub, pos, use_entropy);
+            best_feat = find_best_split_binary_known_counts(
+                mask,
+                n_sub,
+                pos,
+                bb_wrong,
+                use_entropy
+            );
         } else {
             best_feat = find_best_split(mask, use_entropy);
         }
@@ -1657,6 +1909,75 @@ private:
         R.w[(size_t)(n_words - 1)] &= tail_mask;
     }
 
+    inline void split_count_left_binary_fast_(
+        const Packed& mask,
+        const Packed& feat,
+        int& left_n,
+        int& left_pos,
+        int& left_bb_wrong
+    ) const {
+        left_n = 0;
+        left_pos = 0;
+        left_bb_wrong = 0;
+
+        const Packed& Ypos = Y_bits[(size_t)1];
+
+        if (use_deferral) {
+            for (int i = 0; i < n_words; ++i) {
+                const uint64_t lw = mask.w[(size_t)i] & feat.w[(size_t)i];
+                left_n        += popcnt64(lw);
+                left_pos      += popcnt64(lw & Ypos.w[(size_t)i]);
+                left_bb_wrong += popcnt64(lw & BBwrong.w[(size_t)i]);
+            }
+        } else {
+            for (int i = 0; i < n_words; ++i) {
+                const uint64_t lw = mask.w[(size_t)i] & feat.w[(size_t)i];
+                left_n   += popcnt64(lw);
+                left_pos += popcnt64(lw & Ypos.w[(size_t)i]);
+            }
+        }
+    }
+        
+    inline void split_bits_count_left_binary(
+        const Packed& mask,
+        const Packed& feat,
+        Packed& L,
+        Packed& R,
+        int& left_n,
+        int& left_pos,
+        int& left_bb_wrong
+    ) const {
+        left_n = 0;
+        left_pos = 0;
+        left_bb_wrong = 0;
+
+        const Packed& Ypos = Y_bits[(size_t)1];
+
+        if (use_deferral) {
+            for (int i = 0; i < n_words; ++i) {
+                const uint64_t lw = mask.w[(size_t)i] & feat.w[(size_t)i];
+                L.w[(size_t)i] = lw;
+                R.w[(size_t)i] = mask.w[(size_t)i] & ~feat.w[(size_t)i];
+
+                left_n        += popcnt64(lw);
+                left_pos      += popcnt64(lw & Ypos.w[(size_t)i]);
+                left_bb_wrong += popcnt64(lw & BBwrong.w[(size_t)i]);
+            }
+        } else {
+            for (int i = 0; i < n_words; ++i) {
+                const uint64_t lw = mask.w[(size_t)i] & feat.w[(size_t)i];
+                L.w[(size_t)i] = lw;
+                R.w[(size_t)i] = mask.w[(size_t)i] & ~feat.w[(size_t)i];
+
+                left_n   += popcnt64(lw);
+                left_pos += popcnt64(lw & Ypos.w[(size_t)i]);
+            }
+        }
+
+        L.w[(size_t)(n_words - 1)] &= tail_mask;
+        R.w[(size_t)(n_words - 1)] &= tail_mask;
+    }
+
     int depth1_exact_solver_cached(const Packed& mask, const PathKey& pk) {
         // const uint64_t kmask = key_of_subproblem(mask, pk);
         // constexpr int DEPTH = 1;
@@ -1677,10 +1998,13 @@ private:
         }
 
         if (num_classes == 2) {
-            int n_sub, pos_total;
-            count_total_pos_binary(mask, n_sub, pos_total);
+            int n_sub = 0;
+            int pos_total = 0;
+            int bb_wrong_total = 0;
+            count_total_pos_bbwrong_binary(mask, n_sub, pos_total, bb_wrong_total);
 
-            const int leaf_loss = leaf_objective_binary_from_counts(n_sub, pos_total);
+            const int leaf_loss =
+                leaf_objective_binary_from_counts(n_sub, pos_total, bb_wrong_total);
 
             // only cache cheap subproblems if flag enabled
             if (leaf_loss <= 2 * gamma) {
@@ -1696,26 +2020,28 @@ private:
             const int F = proxy_feat_count_();
 
             for (int f = 0; f < F; ++f) {
-                const Packed& Xf = X_bits[(size_t)f];
-
                 int left_n = 0;
                 int left_pos = 0;
+                int left_bb_wrong = 0;
 
-                for (int i = 0; i < n_words; ++i) {
-                    const uint64_t lw = mask.w[(size_t)i] & Xf.w[(size_t)i];
-                    left_n   += popcnt64(lw);
-                    left_pos += popcnt64(lw & Ypos.w[(size_t)i]);
-                }
+                split_count_left_binary_fast_(
+                    mask,
+                    X_bits[(size_t)f],
+                    left_n,
+                    left_pos,
+                    left_bb_wrong
+                );
 
                 const int right_n = n_sub - left_n;
                 if (left_n == 0 || right_n == 0) continue;
 
                 const int right_pos = pos_total - left_pos;
+                const int right_bb_wrong = bb_wrong_total - left_bb_wrong;
 
                 const int sum =
-                    leaf_objective_binary_from_counts(left_n, left_pos)
+                    leaf_objective_binary_from_counts(left_n, left_pos, left_bb_wrong)
                     +
-                    leaf_objective_binary_from_counts(right_n, right_pos);
+                    leaf_objective_binary_from_counts(right_n, right_pos, right_bb_wrong);
 
                 if (sum < best_sum) best_sum = sum;
             }
@@ -1772,11 +2098,12 @@ private:
 
         int n_sub = 0;
         int pos = 0;
+        int bb_wrong = 0;
         int leaf_loss = 0;
 
         if (num_classes == 2) {
-            count_total_pos_binary(mask, n_sub, pos);
-            leaf_loss = leaf_objective_binary_from_counts(n_sub, pos);
+            count_total_pos_bbwrong_binary(mask, n_sub, pos, bb_wrong);
+            leaf_loss = leaf_objective_binary_from_counts(n_sub, pos, bb_wrong);
         } else {
             n_sub = count_total(mask);
             leaf_loss = leaf_objective(mask);
@@ -1796,7 +2123,19 @@ private:
         for (int f = 0; f < F; ++f) {
             if (num_classes == 2) {
                 int left_n = 0;
-                split_bits_count_left(mask, X_bits[f], L, R, left_n);
+                int left_pos = 0;
+                int left_bb_wrong = 0;
+
+                split_bits_count_left_binary(
+                    mask,
+                    X_bits[(size_t)f],
+                    L,
+                    R,
+                    left_n,
+                    left_pos,
+                    left_bb_wrong
+                );
+
                 if (left_n == 0 || left_n == n_sub) continue;
             } else {
                 and_bits(mask, X_bits[f], L);
@@ -1842,11 +2181,12 @@ private:
 
         int n_sub = 0;
         int pos = 0;
+        int bb_wrong = 0;
         int leaf_loss = 0;
 
         if (num_classes == 2) {
-            count_total_pos_binary(mask, n_sub, pos);
-            leaf_loss = leaf_objective_binary_from_counts(n_sub, pos);
+            count_total_pos_bbwrong_binary(mask, n_sub, pos, bb_wrong);
+            leaf_loss = leaf_objective_binary_from_counts(n_sub, pos, bb_wrong);
         } else {
             n_sub = count_total(mask);
             leaf_loss = leaf_objective(mask);
@@ -1866,7 +2206,19 @@ private:
         for (int f = 0; f < F; ++f) {
             if (num_classes == 2) {
                 int left_n = 0;
-                split_bits_count_left(mask, X_bits[f], L, R, left_n);
+                int left_pos = 0;
+                int left_bb_wrong = 0;
+
+                split_bits_count_left_binary(
+                    mask,
+                    X_bits[(size_t)f],
+                    L,
+                    R,
+                    left_n,
+                    left_pos,
+                    left_bb_wrong
+                );
+
                 if (left_n == 0 || left_n == n_sub) continue;
             } else {
                 and_bits(mask, X_bits[f], L);
@@ -2243,6 +2595,7 @@ private:
         const Packed& mask,
         int n_sub,
         int pos_total,
+        int bb_wrong_total,
         bool use_entropy
     ) const {
         if (n_sub <= 1) return -1;
@@ -2293,25 +2646,31 @@ private:
             for (int f = 0; f < F; ++f) {
                 int left_n = 0;
                 int left_pos = 0;
+                int left_bb_wrong = 0;
 
-                const Packed& Xf = X_bits[(size_t)f];
+                Packed L(n_words), R(n_words);
 
-                for (int i = 0; i < n_words; ++i) {
-                    const uint64_t lw = mask.w[(size_t)i] & Xf.w[(size_t)i];
-                    left_n   += popcnt64(lw);
-                    left_pos += popcnt64(lw & Ypos.w[(size_t)i]);
-                }
+                split_bits_count_left_binary(
+                    mask,
+                    X_bits[(size_t)f],
+                    L,
+                    R,
+                    left_n,
+                    left_pos,
+                    left_bb_wrong
+                );
 
                 const int right_n = n_sub - left_n;
                 if (left_n == 0 || right_n == 0) continue;
 
                 const int right_pos = pos_total - left_pos;
+                const int right_bb_wrong = bb_wrong_total - left_bb_wrong;
 
                 const int left_loss =
-                    leaf_objective_binary_from_counts(left_n, left_pos);
+                    leaf_objective_binary_from_counts(left_n, left_pos, left_bb_wrong);
 
                 const int right_loss =
-                    leaf_objective_binary_from_counts(right_n, right_pos);
+                    leaf_objective_binary_from_counts(right_n, right_pos, right_bb_wrong);
 
                 const int sum = left_loss + right_loss;
 
@@ -2326,8 +2685,10 @@ private:
     }
 
     int find_best_split_binary(const Packed& mask, bool use_entropy) const {
-        int n_sub, pos_total;
-        count_total_pos_binary(mask, n_sub, pos_total);
+        int n_sub = 0;
+        int pos_total = 0;
+        int bb_wrong_total = 0;
+        count_total_pos_bbwrong_binary(mask, n_sub, pos_total, bb_wrong_total);
 
         if (n_sub <= 1) return -1;
 
@@ -2377,25 +2738,27 @@ private:
             for (int f = 0; f < F; ++f) {
                 int left_n = 0;
                 int left_pos = 0;
+                int left_bb_wrong = 0;
 
-                const Packed& Xf = X_bits[(size_t)f];
-
-                for (int i = 0; i < n_words; ++i) {
-                    const uint64_t lw = mask.w[(size_t)i] & Xf.w[(size_t)i];
-                    left_n   += popcnt64(lw);
-                    left_pos += popcnt64(lw & Ypos.w[(size_t)i]);
-                }
+                split_count_left_binary_fast_(
+                    mask,
+                    X_bits[(size_t)f],
+                    left_n,
+                    left_pos,
+                    left_bb_wrong
+                );
 
                 const int right_n = n_sub - left_n;
                 if (left_n == 0 || right_n == 0) continue;
 
                 const int right_pos = pos_total - left_pos;
+                const int right_bb_wrong = bb_wrong_total - left_bb_wrong;
 
                 const int left_loss =
-                    gamma + std::min(left_pos, left_n - left_pos);
+                    leaf_objective_binary_from_counts(left_n, left_pos, left_bb_wrong);
 
                 const int right_loss =
-                    gamma + std::min(right_pos, right_n - right_pos);
+                    leaf_objective_binary_from_counts(right_n, right_pos, right_bb_wrong);
 
                 const int sum = left_loss + right_loss;
 
@@ -2505,20 +2868,24 @@ private:
             return t;
         }
 
-        std::vector<int> cnts;
-        count_per_class(mask, cnts);
-        int best_c = 0;
-        int best_cnt = cnts[0];
-        for (int c = 1; c < num_classes; ++c) {
-            int v = cnts[(size_t)c];
-            if (v > best_cnt || (v == best_cnt && c > best_c)) {
-                best_cnt = v;
-                best_c = c;
-            }
-        }
-        const int leaf_pred = best_c;
-        const int mis = n_sub - best_cnt;
-        const int leaf_loss = gamma + mis;
+        // std::vector<int> cnts;
+        // count_per_class(mask, cnts);
+        // int best_c = 0;
+        // int best_cnt = cnts[0];
+        // for (int c = 1; c < num_classes; ++c) {
+        //     int v = cnts[(size_t)c];
+        //     if (v > best_cnt || (v == best_cnt && c > best_c)) {
+        //         best_cnt = v;
+        //         best_c = c;
+        //     }
+        // }
+        // const int leaf_pred = best_c;
+        // const int mis = n_sub - best_cnt;
+        // const int leaf_loss = gamma + mis;
+
+        const BestLeafAction leaf = best_leaf_action(mask);
+        const int leaf_pred = leaf.prediction;
+        const int leaf_loss = leaf.loss;
 
         if (depth_budget <= 0) {
             auto t = make_shared<PredNode>();
@@ -2738,14 +3105,32 @@ private:
         throw out_of_range("Index out of range for given objective in get_kth_tree_with_objective");
     }
 
-    void predict_tree_recursive(const PredNode* node, const std::vector<std::vector<uint8_t>>& X_row_major, std::vector<uint8_t>& out, const std::vector<int>& idx) const {
+    void predict_tree_recursive(
+        const PredNode* node,
+        const std::vector<std::vector<uint8_t>>& X_row_major,
+        const std::vector<int>& bb_pred_row,
+        std::vector<uint8_t>& out,
+        const std::vector<int>& idx,
+        bool use_placeholder,
+        int defer_placeholder
+    ) const {
         if (!node) return;
 
         // leaf: assign prediction to all indices in this subset.
         if (node->feature < 0) {
-            uint8_t pred = static_cast<uint8_t>(node->prediction);
-            for (int row : idx) {
-                out[row] = pred;
+            if (node->prediction == DEFER_PREDICTION) {
+                for (int row : idx) {
+                    const int p = use_placeholder
+                        ? defer_placeholder
+                        : bb_pred_row[(size_t)row];
+
+                    out[(size_t)row] = static_cast<uint8_t>(p);
+                }
+            } else {
+                uint8_t pred = static_cast<uint8_t>(node->prediction);
+                for (int row : idx) {
+                    out[(size_t)row] = pred;
+                }
             }
             return;
         }
@@ -2764,10 +3149,26 @@ private:
         }
 
         if (!left_idx.empty()) {
-            predict_tree_recursive(node->left.get(), X_row_major, out, left_idx);
+            predict_tree_recursive(
+                node->left.get(),
+                X_row_major,
+                bb_pred_row,
+                out,
+                left_idx,
+                use_placeholder,
+                defer_placeholder
+            );
         }
         if (!right_idx.empty()) {
-            predict_tree_recursive(node->right.get(), X_row_major, out, right_idx);
+            predict_tree_recursive(
+                node->right.get(),
+                X_row_major,
+                bb_pred_row,
+                out,
+                right_idx,
+                use_placeholder,
+                defer_placeholder
+            );
         }
     }
 
@@ -2836,18 +3237,17 @@ private:
     }
 
     static inline PackedPredMulti zeros_predmulti(int n_words, int num_classes) {
-        PackedPredMulti pm;
-        pm.by_class.reserve((size_t)num_classes);
-        for (int c = 0; c < num_classes; ++c) {
-            pm.by_class.emplace_back(Packed((size_t)n_words)); // zeros by constructor
-        }
-        return pm;
+        PackedPredMulti p;
+        p.by_class.assign((size_t)num_classes, Packed((size_t)n_words));
+        p.deferred = Packed((size_t)n_words);
+        return p;
     }
 
     static inline void clear_predmulti(PackedPredMulti& pm) {
-        for (auto& p : pm.by_class) {
+        for (Packed& p : pm.by_class) {
             std::fill(p.w.begin(), p.w.end(), 0ULL);
         }
+        std::fill(pm.deferred.w.begin(), pm.deferred.w.end(), 0ULL);
     }
 
     // OR-combine two multiclass prediction packs into out
@@ -2859,14 +3259,28 @@ private:
         uint64_t tail_mask
     ) {
         const int C = (int)a.by_class.size();
+
         for (int c = 0; c < C; ++c) {
             auto& ow = out.by_class[(size_t)c].w;
             const auto& aw = a.by_class[(size_t)c].w;
             const auto& bw = b.by_class[(size_t)c].w;
+
             for (int w = 0; w < n_words; ++w) {
                 ow[(size_t)w] = aw[(size_t)w] | bw[(size_t)w];
             }
-            if (n_words > 0) ow[(size_t)(n_words - 1)] &= tail_mask;
+
+            if (n_words > 0) {
+                ow[(size_t)(n_words - 1)] &= tail_mask;
+            }
+        }
+
+        for (int w = 0; w < n_words; ++w) {
+            out.deferred.w[(size_t)w] =
+                a.deferred.w[(size_t)w] | b.deferred.w[(size_t)w];
+        }
+
+        if (n_words > 0) {
+            out.deferred.w[(size_t)(n_words - 1)] &= tail_mask;
         }
     }
 
@@ -2959,10 +3373,18 @@ private:
             PackedPredMulti pm = zeros_predmulti(ctx.n_words, num_classes);
 
             if (ctx.n_words > 0) {
-                // predicted class gets eval_mask, others stay zero
-                const int pc = leaf.prediction; // should be 0..num_classes-1
-                pm.by_class[(size_t)pc].w = eval_mask.w;
-                pm.by_class[(size_t)pc].w[(size_t)(ctx.n_words - 1)] &= ctx.tail_mask;
+                if (leaf.prediction == DEFER_PREDICTION) {
+                    pm.deferred.w = eval_mask.w;
+                    pm.deferred.w[(size_t)(ctx.n_words - 1)] &= ctx.tail_mask;
+                } else {
+                    const int pc = leaf.prediction;
+                    if (pc < 0 || pc >= num_classes) {
+                        throw std::runtime_error("Leaf prediction is outside valid class range.");
+                    }
+
+                    pm.by_class[(size_t)pc].w = eval_mask.w;
+                    pm.by_class[(size_t)pc].w[(size_t)(ctx.n_words - 1)] &= ctx.tail_mask;
+                }
             }
 
             acc[leaf.loss].push_back(std::move(pm));
@@ -3078,6 +3500,144 @@ private:
         int mistakes;
     };
 
+    struct ObjDeferralBucket {
+        int obj;
+        std::vector<int> deferrals;
+    };
+
+    struct DeferralsWithObj {
+        int obj;
+        int deferrals;
+    };
+
+    static inline std::vector<ObjDeferralBucket> to_sorted_deferral_buckets_(
+        std::unordered_map<int, std::vector<int>>& acc
+    ) {
+        std::vector<ObjDeferralBucket> out;
+        out.reserve(acc.size());
+
+        for (auto& kv : acc) {
+            ObjDeferralBucket b;
+            b.obj = kv.first;
+            b.deferrals = std::move(kv.second);
+            out.push_back(std::move(b));
+        }
+
+        std::sort(out.begin(), out.end(),
+            [](const ObjDeferralBucket& a, const ObjDeferralBucket& b) {
+                return a.obj < b.obj;
+            });
+
+        return out;
+    }
+
+    std::vector<ObjDeferralBucket> collect_deferrals_by_obj_(
+        const TreeTrieNode* node,
+        int budget,
+        const Packed& eval_mask,
+        const EvalCtx& ctx
+    ) const {
+        if (!node) return {};
+        if (budget < 0) return {};
+
+        constexpr int INF = std::numeric_limits<int>::max();
+
+        if (node->min_objective == INF) return {};
+        if (node->min_objective > budget) return {};
+
+        std::unordered_map<int, std::vector<int>> acc;
+
+        const int max_objs = budget - node->min_objective + 1;
+        acc.reserve((size_t)std::max(1, max_objs));
+
+        // leaf alternatives
+        for (const auto& leaf : node->leaves) {
+            if (leaf.loss > budget) continue;
+
+            int n_def = 0;
+
+            if (ctx.n_words > 0 && leaf.prediction == DEFER_PREDICTION) {
+                n_def = count_eval_mask_(eval_mask, ctx.n_words);
+            }
+
+            acc[leaf.loss].push_back(n_def);
+        }
+
+        // split alternatives
+        for (const auto& split : node->splits) {
+            const TreeTrieNode* L = split.left.get();
+            const TreeTrieNode* R = split.right.get();
+            if (!L || !R) continue;
+
+            const int minL = L->min_objective;
+            const int minR = R->min_objective;
+
+            if (minL == INF || minR == INF) continue;
+
+            int bL = budget - minR;
+            int bR = budget - minL;
+
+            if (bL < minL || bR < minR) continue;
+
+            Packed Lmask((size_t)ctx.n_words);
+            Packed Rmask((size_t)ctx.n_words);
+
+            if (ctx.n_words > 0) {
+                const Packed& Xf = ctx.X_bits_eval[(size_t)split.feature];
+
+                for (int w = 0; w < ctx.n_words; ++w) {
+                    const uint64_t mw = eval_mask.w[(size_t)w];
+                    const uint64_t xw = Xf.w[(size_t)w];
+
+                    Lmask.w[(size_t)w] = mw & xw;
+                    Rmask.w[(size_t)w] = mw & ~xw;
+                }
+
+                Lmask.w[(size_t)(ctx.n_words - 1)] &= ctx.tail_mask;
+                Rmask.w[(size_t)(ctx.n_words - 1)] &= ctx.tail_mask;
+            }
+
+            auto Lb = collect_deferrals_by_obj_(L, bL, Lmask, ctx);
+            auto Rb = collect_deferrals_by_obj_(R, bR, Rmask, ctx);
+
+            if (Lb.empty() || Rb.empty()) continue;
+
+            std::vector<int> R_objs;
+            R_objs.reserve(Rb.size());
+            for (const auto& rb : Rb) {
+                R_objs.push_back(rb.obj);
+            }
+
+            for (const auto& lb : Lb) {
+                if (lb.obj > bL) continue;
+
+                const int rem = budget - lb.obj;
+
+                auto it_end = std::upper_bound(R_objs.begin(), R_objs.end(), rem);
+                const int j_end = (int)std::distance(R_objs.begin(), it_end);
+
+                for (int j = 0; j < j_end; ++j) {
+                    const auto& rb = Rb[(size_t)j];
+
+                    const int total_obj = lb.obj + rb.obj;
+                    if (total_obj > budget) continue;
+
+                    auto& vec = acc[total_obj];
+
+                    for (int ld : lb.deferrals) {
+                        for (int rd : rb.deferrals) {
+                            vec.push_back(ld + rd);
+                        }
+                    }
+                }
+            }
+        }
+
+        return to_sorted_deferral_buckets_(acc);
+    }
+
+
+
     static inline std::vector<ObjMistakeBucket> to_sorted_mistake_buckets_(
         std::unordered_map<int, std::vector<int>>& acc
     ) {
@@ -3097,6 +3657,42 @@ private:
             });
 
         return out;
+    }
+
+    static inline Packed build_eval_bb_wrong_bits_(
+        const std::vector<int>& y_eval,
+        const std::vector<int>& bb_pred_eval,
+        int num_classes,
+        int n_words,
+        uint64_t tail_mask
+    ) {
+        if (bb_pred_eval.size() != y_eval.size()) {
+            throw std::runtime_error("Eval bb_pred has different number of rows than Eval y.");
+        }
+
+        Packed wrong((size_t)n_words);
+
+        for (int i = 0; i < (int)y_eval.size(); ++i) {
+            const int yi = y_eval[(size_t)i];
+            const int bi = bb_pred_eval[(size_t)i];
+
+            if (yi < 0 || yi >= num_classes) {
+                throw std::runtime_error("Eval y contains a class not seen during training.");
+            }
+            if (bi < 0 || bi >= num_classes) {
+                throw std::runtime_error("Eval bb_pred contains a class not seen during training.");
+            }
+
+            if (yi != bi) {
+                wrong.w[(size_t)(i >> 6)] |= (1ULL << (i & 63));
+            }
+        }
+
+        if (n_words > 0) {
+            wrong.w[(size_t)(n_words - 1)] &= tail_mask;
+        }
+
+        return wrong;
     }
 
     static inline std::vector<Packed> build_eval_y_bits_(
@@ -3153,7 +3749,8 @@ private:
         int budget,
         const Packed& eval_mask,
         const EvalCtx& ctx,
-        const std::vector<Packed>& Y_eval_bits
+        const std::vector<Packed>& Y_eval_bits,
+        const Packed* BBwrong_eval
     ) const {
         if (!node) return {};
         if (budget < 0) return {};
@@ -3174,21 +3771,36 @@ private:
         for (const auto& leaf : node->leaves) {
             if (leaf.loss > budget) continue;
 
-            const int pred_class = leaf.prediction;
-            if (pred_class < 0 || pred_class >= num_classes) {
-                throw std::runtime_error("Leaf prediction is outside valid class range.");
-            }
-
             int mistakes = 0;
 
             if (ctx.n_words > 0) {
-                const int n_here = count_eval_mask_(eval_mask, ctx.n_words);
-                const int correct = popcount_and_eval_(
-                    eval_mask,
-                    Y_eval_bits[(size_t)pred_class],
-                    ctx.n_words
-                );
-                mistakes = n_here - correct;
+                if (leaf.prediction == DEFER_PREDICTION) {
+                    if (!BBwrong_eval) {
+                        throw std::runtime_error(
+                            "Deferred leaf encountered, but eval bb_pred was not provided."
+                        );
+                    }
+
+                    mistakes = popcount_and_eval_(
+                        eval_mask,
+                        *BBwrong_eval,
+                        ctx.n_words
+                    );
+                } else {
+                    const int pred_class = leaf.prediction;
+                    if (pred_class < 0 || pred_class >= num_classes) {
+                        throw std::runtime_error("Leaf prediction is outside valid class range.");
+                    }
+
+                    const int n_here = count_eval_mask_(eval_mask, ctx.n_words);
+                    const int correct = popcount_and_eval_(
+                        eval_mask,
+                        Y_eval_bits[(size_t)pred_class],
+                        ctx.n_words
+                    );
+
+                    mistakes = n_here - correct;
+                }
             }
 
             acc[leaf.loss].push_back(mistakes);
@@ -3235,8 +3847,8 @@ private:
                 );
             }
 
-            auto Lb = collect_mistakes_by_obj_(L, bL, Lmask, ctx, Y_eval_bits);
-            auto Rb = collect_mistakes_by_obj_(R, bR, Rmask, ctx, Y_eval_bits);
+            auto Lb = collect_mistakes_by_obj_(L, bL, Lmask, ctx, Y_eval_bits, BBwrong_eval);
+            auto Rb = collect_mistakes_by_obj_(R, bR, Rmask, ctx, Y_eval_bits, BBwrong_eval);
 
             if (Lb.empty() || Rb.empty()) continue;
 
@@ -3279,6 +3891,84 @@ private:
     }
 
 public:
+
+    std::vector<DeferralsWithObj> get_all_deferrals_objs_packed_trie(
+        const std::vector<std::vector<uint8_t>>& X_row_major,
+        int budget_override = -1
+    ) const {
+        if (!result) {
+            throw std::runtime_error("No Rashomon trie has been constructed. Call fit() first.");
+        }
+
+        EvalCtx ctx = build_eval_ctx_(X_row_major, this->n_features);
+
+        const int budget = (budget_override >= 0) ? budget_override : result->budget;
+
+        Packed root_mask = eval_root_mask_(ctx.n_words, ctx.tail_mask);
+
+        auto buckets = collect_deferrals_by_obj_(
+            result.get(),
+            budget,
+            root_mask,
+            ctx
+        );
+
+        std::vector<DeferralsWithObj> out;
+
+        size_t total = 0;
+        for (const auto& b : buckets) {
+            total += b.deferrals.size();
+        }
+        out.reserve(total);
+
+        for (auto& b : buckets) {
+            for (int d : b.deferrals) {
+                out.push_back(DeferralsWithObj{b.obj, d});
+            }
+        }
+
+        return out;
+    }
+
+    std::vector<int> get_all_deferrals_packed_trie(
+        const std::vector<std::vector<uint8_t>>& X_row_major,
+        int budget_override = -1
+    ) const {
+        if (!result) {
+            throw std::runtime_error("No Rashomon trie has been constructed. Call fit() first.");
+        }
+
+        EvalCtx ctx = build_eval_ctx_(X_row_major, this->n_features);
+
+        const int budget = (budget_override >= 0) ? budget_override : result->budget;
+
+        Packed root_mask = eval_root_mask_(ctx.n_words, ctx.tail_mask);
+
+        auto buckets = collect_deferrals_by_obj_(
+            result.get(),
+            budget,
+            root_mask,
+            ctx
+        );
+
+        std::vector<int> out;
+
+        size_t total = 0;
+        for (const auto& b : buckets) {
+            total += b.deferrals.size();
+        }
+        out.reserve(total);
+
+        for (auto& b : buckets) {
+            for (int d : b.deferrals) {
+                out.push_back(d);
+            }
+        }
+
+        return out;
+    }
+
+
     // main entry: enumerate ALL valid trees under the trie root (or budget_override if >=0),
     // returning (training_objective, prediction vector on evaluation dataset) for each tree.
     // NOTE: this can be extremely large in memory if the Rashomon set is huge.
@@ -3316,7 +4006,8 @@ public:
     std::vector<MistakesWithObj> get_all_misclassifications_objs_packed_trie(
         const std::vector<std::vector<uint8_t>>& X_row_major,
         const std::vector<int>& y_eval,
-        int budget_override = -1
+        int budget_override = -1,
+        const std::vector<int>& bb_pred_eval = {}
     ) const {
         if (!result) {
             throw std::runtime_error("No Rashomon trie has been constructed. Call fit() first.");
@@ -3339,12 +4030,37 @@ public:
             ctx.tail_mask
         );
 
-        auto buckets = collect_mistakes_by_obj_(
+        Packed BBwrong_eval_storage((size_t)ctx.n_words);
+        const Packed* BBwrong_eval_ptr = nullptr;
+
+        if (use_deferral) {
+            if (bb_pred_eval.empty()) {
+                throw std::runtime_error(
+                    "get_all_misclassifications_objs_packed_trie: "
+                    "deferral was enabled during fit, so bb_pred_eval is required."
+                );
+            }
+
+            BBwrong_eval_storage = build_eval_bb_wrong_bits_(
+                y_eval,
+                bb_pred_eval,
+                num_classes,
+                ctx.n_words,
+                ctx.tail_mask
+            );
+
+            BBwrong_eval_ptr = &BBwrong_eval_storage;
+        }
+
+
+
+       auto buckets = collect_mistakes_by_obj_(
             result.get(),
             budget,
             root_mask,
             ctx,
-            Y_eval_bits
+            Y_eval_bits,
+            BBwrong_eval_ptr
         );
 
         std::vector<MistakesWithObj> out;
@@ -3367,7 +4083,8 @@ public:
     std::vector<int> get_all_misclassifications_packed_trie(
         const std::vector<std::vector<uint8_t>>& X_row_major,
         const std::vector<int>& y_eval,
-        int budget_override = -1
+        int budget_override = -1,
+        const std::vector<int>& bb_pred_eval = {}
     ) const {
         if (!result) {
             throw std::runtime_error("No Rashomon trie has been constructed. Call fit() first.");
@@ -3390,12 +4107,35 @@ public:
             ctx.tail_mask
         );
 
+        Packed BBwrong_eval_storage((size_t)ctx.n_words);
+        const Packed* BBwrong_eval_ptr = nullptr;
+
+        if (use_deferral) {
+            if (bb_pred_eval.empty()) {
+                throw std::runtime_error(
+                    "get_all_misclassifications_objs_packed_trie: "
+                    "deferral was enabled during fit, so bb_pred_eval is required."
+                );
+            }
+
+            BBwrong_eval_storage = build_eval_bb_wrong_bits_(
+                y_eval,
+                bb_pred_eval,
+                num_classes,
+                ctx.n_words,
+                ctx.tail_mask
+            );
+
+            BBwrong_eval_ptr = &BBwrong_eval_storage;
+        }
+
         auto buckets = collect_mistakes_by_obj_(
             result.get(),
             budget,
             root_mask,
             ctx,
-            Y_eval_bits
+            Y_eval_bits,
+            BBwrong_eval_ptr
         );
 
         std::vector<int> out;

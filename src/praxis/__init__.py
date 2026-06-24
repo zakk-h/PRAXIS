@@ -14,7 +14,9 @@ import re
 from pathlib import Path
 from importlib.resources import files
 
-__all__ = ["PRAXIS", "ThresholdGuessBinarizer"]
+DEFER_PREDICTION = -1
+
+__all__ = ["PRAXIS", "ThresholdGuessBinarizer", "DEFER_PREDICTION"]
 
 def _json_safe(x):
     if isinstance(x, (np.integer,)):
@@ -205,6 +207,39 @@ def _validate_class_labels(y):
 
     return y_arr
 
+def _validate_bb_pred(bb_pred, n_samples, n_classes=None):
+    if bb_pred is None:
+        return None
+
+    bb = np.asarray(bb_pred)
+
+    if bb.ndim != 1:
+        raise ValueError(f"bb_pred must be 1D. Got shape {bb.shape}.")
+
+    if bb.shape[0] != n_samples:
+        raise ValueError(
+            f"bb_pred must have the same number of rows as X/y. "
+            f"Got bb_pred.shape[0]={bb.shape[0]} and n_samples={n_samples}."
+        )
+
+    if not np.issubdtype(bb.dtype, np.integer):
+        if np.issubdtype(bb.dtype, np.floating) and np.all(np.isfinite(bb)) and np.all(bb == np.floor(bb)):
+            bb = bb.astype(int)
+        else:
+            raise ValueError("bb_pred must contain integer class predictions.")
+
+    bb = np.asarray(bb, dtype=int)
+
+    if np.any(bb < 0):
+        raise ValueError("bb_pred must contain nonnegative class predictions.")
+
+    if n_classes is not None and np.any(bb >= n_classes):
+        raise ValueError(
+            f"bb_pred contains class predictions outside [0, {n_classes})."
+        )
+
+    return bb
+
 class PRAXIS:
     def __init__(self):
         self._model = _PRAXISCore()
@@ -232,6 +267,9 @@ class PRAXIS:
         num_proxy_features=0,
         proxy_only=False,
         stronger_rollout=False,
+        use_deferral=False,
+        eta_defer=0.0,
+        bb_pred=None, 
     ):
         X = _validate_binary_X(X)
         y = _validate_class_labels(y)
@@ -241,6 +279,15 @@ class PRAXIS:
                 f"X and y must have the same number of samples. "
                 f"Got X.shape[0]={X.shape[0]} and y.shape[0]={y.shape[0]}."
             )
+
+        n_classes = int(np.max(y)) + 1
+        bb_pred = _validate_bb_pred(bb_pred, X.shape[0], n_classes=n_classes)
+
+        if use_deferral and bb_pred is None:
+            raise ValueError("use_deferral=True requires bb_pred.")
+
+        if eta_defer < 0 or not np.isfinite(eta_defer):
+            raise ValueError("eta_defer must be finite and nonnegative.")
 
         proxy_style_int = parse_proxy_style(proxy_style)
         greedy_heur_int = parse_heuristic_for_greedy(heuristic_for_greedy)
@@ -272,6 +319,9 @@ class PRAXIS:
             int(num_proxy_features),
             bool(rashomon_mode),
             bool(stronger_rollout),
+            bool(use_deferral),
+            float(eta_defer),
+            bb_pred,
         )
 
     def count_trees(self):
@@ -514,13 +564,81 @@ class PRAXIS:
 
         return out, preds
     
-    def get_predictions(self, tree_index: int, X):
+    def get_predictions(self, tree_index: int, X, bb_pred=None, defer_placeholder=99):
         X = np.asarray(X, dtype=np.uint8)
-        return self._model.get_predictions(int(tree_index), X)
+        bb_pred = _validate_bb_pred(bb_pred, X.shape[0]) if bb_pred is not None else None
+        return self._model.get_predictions(
+            int(tree_index),
+            X,
+            bb_pred,
+            int(defer_placeholder),
+        )
 
-    def get_all_predictions(self, X, stack: bool = False):
+    def get_all_predictions(self, X, stack: bool = False, bb_pred=None, defer_placeholder=99):
         X = np.asarray(X, dtype=np.uint8)
-        return self._model.get_all_predictions(X, bool(stack))
+        bb_pred = _validate_bb_pred(bb_pred, X.shape[0]) if bb_pred is not None else None
+        return self._model.get_all_predictions(
+            X,
+            bool(stack),
+            bb_pred,
+            int(defer_placeholder),
+        )
+
+    def get_all_misclassifications(self, X, y, budget_override=None, bb_pred=None):
+        X = np.asarray(X, dtype=np.uint8)
+        y = _validate_class_labels(y)
+
+        if X.shape[0] != y.shape[0]:
+            raise ValueError(
+                f"X and y must have the same number of samples. "
+                f"Got X.shape[0]={X.shape[0]} and y.shape[0]={y.shape[0]}."
+            )
+
+        bb_pred = _validate_bb_pred(bb_pred, X.shape[0]) if bb_pred is not None else None
+
+        if budget_override is None:
+            budget_override = int(round((1.0 + 0.0) * self.get_min_objective()))
+
+        return self._model.get_all_misclassifications_packed_trie(
+            X,
+            y,
+            int(budget_override),
+            bb_pred,
+        )
+
+
+    def get_all_deferrals(self, X, budget_override=None):
+        X = np.asarray(X, dtype=np.uint8)
+
+        if budget_override is None:
+            budget_override = self.get_min_objective()
+
+        return self._model.get_all_deferrals_packed_trie(
+            X,
+            int(budget_override),
+        )
+
+
+    def get_all_eval_objectives(self, X, y, eta_defer, budget_override=None, bb_pred=None):
+        mis = np.asarray(
+            self.get_all_misclassifications(
+                X,
+                y,
+                budget_override=budget_override,
+                bb_pred=bb_pred,
+            ),
+            dtype=int,
+        )
+
+        defs = np.asarray(
+            self.get_all_deferrals(
+                X,
+                budget_override=budget_override,
+            ),
+            dtype=int,
+        )
+
+        return mis + np.rint(float(eta_defer) * defs).astype(int)
     
     def plot_tree(self, tree_index: int, feature_names=None, figsize=(8, 6), ax=None, title=None, show=True):
         paths, preds = self.get_tree_paths(tree_index)
@@ -712,10 +830,16 @@ class PRAXIS:
                 radius = internal_r
                 label = None
             else:
-                if int(node.prediction) == 0:
-                    face = "#E69F00"
+                pred = int(node.prediction)
+                if pred == -1:
+                    face = "#000000" # defer
+                elif pred == 0:
+                    face = "#E69F00" # keep binary class 0 orange
+                elif pred == 1 and max(int(p) for p in preds) <= 1:
+                    face = "#009E73" # keep binary class 1 green
                 else:
-                    face = "#009E73"
+                    cmap = plt.colormaps.get_cmap("tab10")
+                    face = cmap(pred % 10)
                 edge = "#4D4D4D"
                 text_color = "#111111"
                 radius = leaf_r
@@ -808,9 +932,30 @@ class PRAXIS:
         seed=0,
         memory_efficient=False,
         binning_map=None,
+        use_deferral=False,
+        eta_defer=0.0,
+        bb_pred=None,
     ):
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=int)
+
+        X = _validate_binary_X(X)
+        y = _validate_class_labels(y)
+
+        if X.shape[0] != y.shape[0]:
+            raise ValueError(
+                f"X and y must have the same number of samples. "
+                f"Got X.shape[0]={X.shape[0]} and y.shape[0]={y.shape[0]}."
+            )
+
+        n_classes = int(np.max(y)) + 1
+        bb_pred = _validate_bb_pred(bb_pred, X.shape[0], n_classes=n_classes)
+
+        if use_deferral and bb_pred is None:
+            raise ValueError("use_deferral=True requires bb_pred.")
+
+        if eta_defer < 0 or not np.isfinite(eta_defer):
+            raise ValueError("eta_defer must be finite and nonnegative.")
 
         binning_map, feature_indices = self._canonicalize_binning_map(binning_map)
         self._rid_feature_indices = feature_indices
@@ -826,6 +971,9 @@ class PRAXIS:
             int(seed),
             bool(memory_efficient),
             binning_map,
+            bool(use_deferral),
+            float(eta_defer),
+            bb_pred,
         )
         return self._rid_out
         
@@ -1016,7 +1164,7 @@ def rid_plot_mean(
     ax.set_xticks(x)
     ax.set_xticklabels(feature_names, rotation=45, ha="right")
     ax.set_xlabel("feature")
-    ax.set_ylabel("mean reliance\n(average accuracy drop when scrambled)")
+    ax.set_ylabel("mean reliance\n(average objective change when scrambled)")
     ax.set_title(title)
     _rid_style_ax(ax)
 
@@ -1105,7 +1253,7 @@ def rid_plot_violin(
 
     ax.set_yticks(np.arange(V))
     ax.set_yticklabels(names_s)
-    ax.set_xlabel("Accuracy drop when scrambled")
+    ax.set_xlabel("Objective change when scrambled")
     ax.set_ylabel("feature")
     ax.set_title(title)
     ax.set_xlim(xmin, xmax)
@@ -1160,8 +1308,8 @@ def rid_plot_cdfs(
         ax.plot(xs, ps, linewidth=1.8, alpha=0.9, color=colors[j], label=feature_names[j])
 
     ax.set_title(title)
-    ax.set_xlabel("Accuracy drop when scrambled")
-    ax.set_ylabel("P[Δ accuracy ≤ t]")
+    ax.set_xlabel("Objective change when scrambled")
+    ax.set_ylabel("P[Δ objective ≤ t]")
     ax.set_xlim(xmin, xmax)
     ax.set_ylim(-0.02, 1.02)
     _rid_style_ax(ax)
