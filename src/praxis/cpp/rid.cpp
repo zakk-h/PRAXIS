@@ -13,6 +13,9 @@ struct RIDResult {
     std::vector<double> mean_sub_mr;
     std::vector<std::vector<double>> cdf_x;
     std::vector<std::vector<double>> cdf_p;
+
+    // optionally (when return_joint_samples=true return one vector per tree per bootstrap of feature importances
+    std::vector<std::vector<double>> feature_importance_weight_samples;
 };
 
 static inline uint64_t popcnt64_u(uint64_t x) {
@@ -237,7 +240,8 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
     const std::vector<std::vector<int>>& binning_map_vars = {},
     bool use_deferral = false,
     double eta_defer = 0.0,
-    const std::vector<int>& bb_pred = {}
+    const std::vector<int>& bb_pred = {},
+    bool return_joint_samples = false
 ) {
     (void)memory_efficient;
 
@@ -413,6 +417,24 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         // weight per tree per bootstrap.
         const double wt_tree = 1.0 / ((double)n_bootstraps * (double)Tvec);
 
+        // if requested, allocate one dense feature-importance row per tree in this bootstrap.
+        // the final column stores the tree weight
+        std::size_t sample_offset = 0;
+        if (return_joint_samples) {
+            sample_offset = out.feature_importance_weight_samples.size();
+
+            out.feature_importance_weight_samples.resize(
+                sample_offset + (std::size_t)Tvec,
+                std::vector<double>((std::size_t)V + 1, 0.0)
+            );
+
+            for (uint64_t t = 0; t < Tvec; ++t) {
+                out.feature_importance_weight_samples[
+                    sample_offset + (std::size_t)t
+                ][(std::size_t)V] = wt_tree;
+            }
+        }
+
         // possible future optimization:
         // convert the bootstrap to column-major once, scramble columns in column-major,
         // and add a packed-trie extraction method that accepts column-major eval data.
@@ -490,9 +512,16 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
                 // delta_obj = scrambled eval objective - original eval objective.
                 // larger positive means the feature matters more.
                 const int delta_obj = scr_obj - orig_obj;
+                const double importance = (double)delta_obj / (double)n;
 
-                out.mean_sub_mr[v] += wt_tree * ((double)delta_obj / (double)n);
+                out.mean_sub_mr[v] += wt_tree * importance;
                 mass_by_delta[(size_t)v][delta_obj] += wt_tree;
+
+                if (return_joint_samples) {
+                    out.feature_importance_weight_samples[
+                        sample_offset + (std::size_t)t
+                    ][(std::size_t)v] = importance;
+                }
             }
 
             restore_block_inplace(Xb, cols, saved_cols);

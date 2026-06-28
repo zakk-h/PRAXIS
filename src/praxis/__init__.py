@@ -939,6 +939,7 @@ class PRAXIS:
         use_deferral=False,
         eta_defer=0.0,
         bb_pred=None,
+        return_joint_samples=False,
     ):
         X = np.asarray(X, dtype=np.uint8)
         y = np.asarray(y, dtype=int)
@@ -978,6 +979,7 @@ class PRAXIS:
             bool(use_deferral),
             float(eta_defer),
             bb_pred,
+            bool(return_joint_samples),
         )
         return self._rid_out
         
@@ -1025,6 +1027,26 @@ class PRAXIS:
         rid_out = self._require_rid()
         feature_names = self._resolve_rid_feature_names(feature_names)
         return rid_plot_cdfs(rid_out, feature_names=feature_names, **kwargs)
+
+    def rid_plot_pair(self, feature_a, feature_b, feature_names=None, **kwargs):
+        rid_out = self._require_rid()
+        feature_names = self._resolve_rid_feature_names(feature_names)
+        return rid_plot_pair(
+            rid_out,
+            feature_a,
+            feature_b,
+            feature_names=feature_names,
+            **kwargs,
+        )
+
+    def rid_plot_all_pairs(self, feature_names=None, **kwargs):
+        rid_out = self._require_rid()
+        feature_names = self._resolve_rid_feature_names(feature_names)
+        return rid_plot_all_pairs(
+            rid_out,
+            feature_names=feature_names,
+            **kwargs,
+        )
     
     @staticmethod
     def _require_binary_predictions(preds):
@@ -1330,6 +1352,180 @@ def rid_plot_cdfs(
     if show:
         plt.show()
     return fig, ax
+
+def _rid_joint_samples(rid_out):
+    key = "feature_importance_weight_samples"
+
+    if key not in rid_out:
+        raise RuntimeError(
+            "Joint RID samples were not returned. "
+            "Call compute_rid(..., return_joint_samples=True) first."
+        )
+
+    S = np.asarray(rid_out[key], dtype=float)
+
+    if S.ndim != 2 or S.shape[1] < 2:
+        raise ValueError(
+            "feature_importance_weight_samples must be a 2D array with "
+            "feature columns followed by one weight column."
+        )
+
+    return S
+
+
+def _rid_feature_index(feature, feature_names, V):
+    if isinstance(feature, (int, np.integer)):
+        j = int(feature)
+        if j < 0 or j >= V:
+            raise IndexError(f"feature index {j} is outside [0, {V}).")
+        return j
+
+    if feature_names is None:
+        raise ValueError(
+            "String feature names require feature_names to be provided."
+        )
+
+    feature = str(feature)
+    if feature not in feature_names:
+        raise ValueError(
+            f"Unknown feature '{feature}'. Available features: {feature_names}"
+        )
+
+    return int(feature_names.index(feature))
+
+
+def rid_plot_pair(
+    rid_out,
+    feature_a,
+    feature_b,
+    feature_names=None,
+    figsize=(5.5, 5.0),
+    ax=None,
+    title=None,
+    alpha=0.35,
+    s=14,
+    use_weights_for_alpha=False,
+    show=True,
+):
+    S = _rid_joint_samples(rid_out)
+
+    V = S.shape[1] - 1
+    feature_names = _rid_feature_names(feature_names, V)
+
+    j = _rid_feature_index(feature_a, feature_names, V)
+    k = _rid_feature_index(feature_b, feature_names, V)
+
+    x = S[:, j]
+    y = S[:, k]
+    w = S[:, -1]
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    if use_weights_for_alpha:
+        # scale weights
+        ww = np.asarray(w, dtype=float)
+        if ww.size and np.max(ww) > np.min(ww):
+            aa = 0.08 + 0.55 * (ww - np.min(ww)) / (np.max(ww) - np.min(ww))
+        else:
+            aa = np.full_like(ww, float(alpha), dtype=float)
+
+        ax.scatter(x, y, s=s, alpha=None, c="black")
+    else:
+        ax.scatter(x, y, s=s, alpha=alpha)
+
+    ax.set_xlabel(f"RID importance: {feature_names[j]}")
+    ax.set_ylabel(f"RID importance: {feature_names[k]}")
+
+    if title is None:
+        title = f"RID pair distribution: {feature_names[j]} vs {feature_names[k]}"
+    ax.set_title(title)
+
+    _rid_style_ax(ax)
+    fig.tight_layout()
+
+    if show:
+        plt.show()
+
+    return fig, ax
+
+
+def rid_plot_all_pairs(
+    rid_out,
+    feature_names=None,
+    max_features=None,
+    order_by_mean=True,
+    figsize_per_panel=(3.2, 3.0),
+    alpha=0.25,
+    s=8,
+    show=True,
+):
+    S = _rid_joint_samples(rid_out)
+
+    V = S.shape[1] - 1
+    feature_names = _rid_feature_names(feature_names, V)
+
+    if max_features is None:
+        features = list(range(V))
+    else:
+        max_features = int(max_features)
+        if max_features < 2:
+            raise ValueError("max_features must be at least 2.")
+
+        if order_by_mean and "mean_sub_mr" in rid_out:
+            mean = np.asarray(rid_out["mean_sub_mr"], dtype=float)
+            features = list(np.argsort(-mean)[:max_features])
+        else:
+            features = list(range(min(V, max_features)))
+
+    m = len(features)
+    if m < 2:
+        raise ValueError("Need at least two features to plot pairs.")
+
+    n_pairs = m * (m - 1) // 2
+    ncols = int(np.ceil(np.sqrt(n_pairs)))
+    nrows = int(np.ceil(n_pairs / ncols))
+
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(figsize_per_panel[0] * ncols, figsize_per_panel[1] * nrows),
+        squeeze=False,
+    )
+
+    pair_idx = 0
+    for a in range(m):
+        for b in range(a + 1, m):
+            j = features[a]
+            k = features[b]
+
+            r = pair_idx // ncols
+            c = pair_idx % ncols
+            ax = axes[r][c]
+
+            ax.scatter(S[:, j], S[:, k], s=s, alpha=alpha)
+            ax.set_xlabel(feature_names[j])
+            ax.set_ylabel(feature_names[k])
+            ax.set_title(f"{feature_names[j]} vs {feature_names[k]}", fontsize=10)
+            _rid_style_ax(ax)
+
+            pair_idx += 1
+
+    # hide unused axes.
+    for idx in range(pair_idx, nrows * ncols):
+        r = idx // ncols
+        c = idx % ncols
+        axes[r][c].set_axis_off()
+
+    fig.suptitle("Pairwise RID feature-importance distributions", y=1.02)
+    fig.tight_layout()
+
+    if show:
+        plt.show()
+
+    return fig, axes
 
 
 class _BuildNode:

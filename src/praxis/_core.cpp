@@ -651,7 +651,8 @@ PYBIND11_MODULE(_core, m) {
            py::object binning_map_obj,
            bool use_deferral,
            double eta_defer,
-           py::object bb_pred_obj
+           py::object bb_pred_obj,
+           bool return_joint_samples
         ) {
             py::buffer_info xinfo = X.request();
             py::buffer_info yinfo = y.request();
@@ -744,13 +745,18 @@ PYBIND11_MODULE(_core, m) {
                 groups,
                 use_deferral,
                 eta_defer,
-                bb_pred_vec
+                bb_pred_vec,
+                return_joint_samples
             );
 
             py::dict out;
             out["mean_sub_mr"] = r.mean_sub_mr;
             out["cdf_x"] = r.cdf_x;
             out["cdf_p"] = r.cdf_p;
+            if (return_joint_samples) {
+                out["feature_importance_weight_samples"] =
+                    r.feature_importance_weight_samples;
+            }
 
             return out;
         },
@@ -766,6 +772,7 @@ PYBIND11_MODULE(_core, m) {
         py::arg("binning_map") = py::none(),
         py::arg("use_deferral") = false,
         py::arg("eta_defer") = 0.0,
-        py::arg("bb_pred") = py::none()
+        py::arg("bb_pred") = py::none(),
+        py::arg("return_joint_samples") = false
     );
 }
