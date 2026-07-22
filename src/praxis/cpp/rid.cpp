@@ -6,6 +6,7 @@
 #include <iostream>
 #include <cmath>
 #include <stdexcept>
+#include <map>
 
 using std::cout;
 
@@ -231,6 +232,7 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
     const std::vector<std::vector<uint8_t>>& X_row_major,
     const std::vector<int>& y,
     int n_bootstraps,
+    int n_scramble_evals,
     double lambda,
     int depth_budget,
     double rashomon_mult,
@@ -249,6 +251,19 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
 
     if (n_full == 0) {
         throw std::runtime_error("compute_rid_subtractive_mr_bootstrap: X is empty.");
+    }
+
+    if (n_bootstraps <= 0) {
+        throw std::runtime_error(
+            "compute_rid_subtractive_mr_bootstrap: n_bootstraps must be positive."
+        );
+    }
+
+    if (n_scramble_evals <= 0) {
+        throw std::runtime_error(
+            "compute_rid_subtractive_mr_bootstrap: "
+            "n_scramble_evals must be positive."
+        );
     }
 
     const int d = (int)X_row_major[0].size();
@@ -304,7 +319,8 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
     // delta = scr_eval_objective - orig_eval_objective,
     // where eval objective ignores leaf count because it is constant under permutation:
     // eval_objective = misclassifications + round(eta_defer * num_deferrals).
-    std::vector<std::unordered_map<int, double>> mass_by_delta(V);
+    // this may be averaged across scrambles
+    std::vector<std::map<double, double>> mass_by_importance((size_t)V);
 
     for (int b = 0; b < n_bootstraps; ++b) {
         std::vector<int> idx;
@@ -365,11 +381,11 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
 
         // pre-sample permutations for each original variable.
         // one scramble per variable per bootstrap.
-        std::vector<std::vector<int>> perms((size_t)V);
+        // std::vector<std::vector<int>> perms((size_t)V);
 
-        for (int v = 0; v < V; ++v) {
-            make_permutation(n, rng, perms[(size_t)v]);
-        }
+        // for (int v = 0; v < V; ++v) {
+        //     make_permutation(n, rng, perms[(size_t)v]);
+        // }
 
         // reuse buffer for column/block scrambling.
         std::vector<std::vector<uint8_t>> saved_cols;
@@ -414,6 +430,20 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
             continue;
         }
 
+        std::vector<int> orig_obj((size_t)Tvec);
+
+        for (uint64_t t = 0; t < Tvec; ++t) {
+            const int orig_def_t =
+                use_deferral ? orig_def[(size_t)t] : 0;
+
+            orig_obj[(size_t)t] = rid_eval_objective_from_mis_def(
+                orig_mis[(size_t)t],
+                orig_def_t,
+                use_deferral,
+                eta_defer
+            );
+        }
+
         // weight per tree per bootstrap.
         const double wt_tree = 1.0 / ((double)n_bootstraps * (double)Tvec);
 
@@ -441,122 +471,126 @@ RIDResult compute_rid_subtractive_mr_bootstrap(
         for (int v = 0; v < V; ++v) {
             const std::vector<int>& cols = var_cols[(size_t)v];
 
-            scramble_block_inplace(
-                Xb,
-                cols,
-                perms[(size_t)v],
-                saved_cols
+            // one running average per tree. Memory is O(number of trees),
+            // independent of n_scramble_evals.
+            std::vector<int64_t> sum_delta_obj(
+                (size_t)Tvec,
+                0
             );
 
-            std::vector<int> scr_mis;
-            if (use_deferral) {
-                scr_mis = model.get_all_misclassifications_packed_trie(
-                    Xb,
-                    yb,
-                    budget_override,
-                    bb_pred_b
-                );
-            } else {
-                scr_mis = model.get_all_misclassifications_packed_trie(
-                    Xb,
-                    yb,
-                    budget_override
-                );
-            }
+            // reuse one permutation buffer for every scramble evaluation.
+            std::vector<int> perm;
 
-            std::vector<int> scr_def;
-            if (use_deferral) {
-                scr_def = model.get_all_deferrals_packed_trie(
+            for (int r = 0; r < n_scramble_evals; ++r) {
+                make_permutation(n, rng, perm);
+
+                scramble_block_inplace(
                     Xb,
-                    budget_override
+                    cols,
+                    perm,
+                    saved_cols
                 );
 
-                if (scr_def.size() != scr_mis.size()) {
-                    throw std::runtime_error(
-                        "RID deferral: scr_def and scr_mis have different lengths."
+                std::vector<int> scr_mis;
+                if (use_deferral) {
+                    scr_mis = model.get_all_misclassifications_packed_trie(
+                        Xb,
+                        yb,
+                        budget_override,
+                        bb_pred_b
+                    );
+                } else {
+                    scr_mis = model.get_all_misclassifications_packed_trie(
+                        Xb,
+                        yb,
+                        budget_override
                     );
                 }
-            }
 
-            const uint64_t Tuse = Tvec;
+                std::vector<int> scr_def;
+                if (use_deferral) {
+                    scr_def = model.get_all_deferrals_packed_trie(
+                        Xb,
+                        budget_override
+                    );
 
-            if ((uint64_t)scr_mis.size() != Tuse) {
-                throw std::runtime_error(
-                    "RID: scrambled and original misclassification vectors have different lengths."
+                    if (scr_def.size() != scr_mis.size()) {
+                        throw std::runtime_error(
+                            "RID deferral: scr_def and scr_mis "
+                            "have different lengths."
+                        );
+                    }
+                }
+
+                if ((uint64_t)scr_mis.size() != Tvec) {
+                    throw std::runtime_error(
+                        "RID: scrambled and original misclassification "
+                        "vectors have different lengths."
+                    );
+                }
+
+                for (uint64_t t = 0; t < Tvec; ++t) {
+
+                    const int original_obj = orig_obj[(size_t)t];
+
+                    const int scr_def_t =
+                        use_deferral ? scr_def[(size_t)t] : 0;
+              
+                    const int scr_obj = rid_eval_objective_from_mis_def(
+                        scr_mis[(size_t)t],
+                        scr_def_t,
+                        use_deferral,
+                        eta_defer
+                    );
+
+                    const int delta_obj = scr_obj - original_obj;
+
+                    // add one-rth of this scramble's normalized importance.
+                    sum_delta_obj[(size_t)t] += (int64_t)delta_obj;
+                }
+
+                // restore before constructing the next independent permutation.
+                restore_block_inplace(
+                    Xb,
+                    cols,
+                    saved_cols
                 );
             }
 
-            for (uint64_t t = 0; t < Tuse; ++t) {
-                const int orig_def_t = use_deferral ? orig_def[(size_t)t] : 0;
-                const int scr_def_t  = use_deferral ? scr_def[(size_t)t]  : 0;
+            // add each tree's scramble-averaged importance exactly once.
+            for (uint64_t t = 0; t < Tvec; ++t) {
+                const double importance =
+                    (double)sum_delta_obj[(size_t)t]
+                    / ((double)n * (double)n_scramble_evals);
 
-                const int orig_obj = rid_eval_objective_from_mis_def(
-                    orig_mis[(size_t)t],
-                    orig_def_t,
-                    use_deferral,
-                    eta_defer
-                );
-
-                const int scr_obj = rid_eval_objective_from_mis_def(
-                    scr_mis[(size_t)t],
-                    scr_def_t,
-                    use_deferral,
-                    eta_defer
-                );
-
-                // non-deferral case:
-                // delta_obj = scr_mis - orig_mis
-                // = correct_orig - correct_scr.
-                //
-                // deferral case:
-                // delta_obj = scrambled eval objective - original eval objective.
-                // larger positive means the feature matters more.
-                const int delta_obj = scr_obj - orig_obj;
-                const double importance = (double)delta_obj / (double)n;
-
-                out.mean_sub_mr[v] += wt_tree * importance;
-                mass_by_delta[(size_t)v][delta_obj] += wt_tree;
+                out.mean_sub_mr[(size_t)v] += wt_tree * importance;
+                mass_by_importance[(size_t)v][importance] += wt_tree;
 
                 if (return_joint_samples) {
                     out.feature_importance_weight_samples[
-                        sample_offset + (std::size_t)t
-                    ][(std::size_t)v] = importance;
+                        sample_offset + (size_t)t
+                    ][(size_t)v] = importance;
                 }
             }
-
-            restore_block_inplace(Xb, cols, saved_cols);
         }
     }
 
     // build weighted CDF for each feature from the mass map.
     for (int v = 0; v < V; ++v) {
-        std::vector<std::pair<int, double>> items;
-        items.reserve(mass_by_delta[(size_t)v].size());
+        const auto& mass = mass_by_importance[(size_t)v];
 
-        for (const auto& kv : mass_by_delta[(size_t)v]) {
-            items.push_back(kv);
-        }
-
-        std::sort(
-            items.begin(),
-            items.end(),
-            [](const auto& a, const auto& b) {
-                return a.first < b.first;
-            }
-        );
-
-        out.cdf_x[(size_t)v].reserve(items.size());
-        out.cdf_p[(size_t)v].reserve(items.size());
+        out.cdf_x[(size_t)v].reserve(mass.size());
+        out.cdf_p[(size_t)v].reserve(mass.size());
 
         double cum = 0.0;
 
-        for (const auto& kv : items) {
-            const int delta = kv.first;
-            const double w = kv.second;
+        for (const auto& kv : mass) {
+            const double importance = kv.first;
+            const double weight = kv.second;
 
-            cum += w;
+            cum += weight;
 
-            out.cdf_x[(size_t)v].push_back((double)delta / (double)n_full);
+            out.cdf_x[(size_t)v].push_back(importance);
             out.cdf_p[(size_t)v].push_back(cum);
         }
     }

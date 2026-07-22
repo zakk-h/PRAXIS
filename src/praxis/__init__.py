@@ -929,6 +929,7 @@ class PRAXIS:
         X,
         y,
         n_boot=10,
+        n_scramble_evals=1,
         lambda_reg=0.01,
         depth_budget=5,
         rashomon_mult=0.03,
@@ -962,6 +963,15 @@ class PRAXIS:
         if eta_defer < 0 or not np.isfinite(eta_defer):
             raise ValueError("eta_defer must be finite and nonnegative.")
 
+        n_boot = int(n_boot)
+        n_scramble_evals = int(n_scramble_evals)
+
+        if n_boot <= 0:
+            raise ValueError("n_boot must be positive.")
+
+        if n_scramble_evals <= 0:
+            raise ValueError("n_scramble_evals must be positive.")
+
         binning_map, feature_indices = self._canonicalize_binning_map(binning_map)
         self._rid_feature_indices = feature_indices
 
@@ -969,6 +979,7 @@ class PRAXIS:
             X,
             y,
             int(n_boot),
+            n_scramble_evals,
             float(lambda_reg),
             int(depth_budget),
             float(rashomon_mult),
